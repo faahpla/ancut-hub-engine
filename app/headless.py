@@ -1,0 +1,770 @@
+"""Executa o pipeline sem interface, falando JSON-lines no stdout.
+
+É o backend do AnCut HUB em Electron: o processo Electron sobe este módulo
+como processo filho, manda a requisição e lê os eventos conforme saem.
+
+Protocolo
+---------
+stdout  → um objeto JSON por linha (ver `_emit`). NADA além disso.
+stderr  → log humano (os prints do pipeline são redirecionados pra cá).
+stdin   → comandos JSON-line do host; hoje só ``{"cmd": "cancel"}``.
+
+Uso:
+    python -m app.headless run        (requisição JSON pelo stdin, 1ª linha)
+    python -m app.headless probe      (info de ambiente: versão, GPU)
+
+Por que stdout é sagrado: o pipeline inteiro usa `print()` pra log. Se um
+print vazar no canal de eventos, o JSON quebra no meio e o host perde o
+stream. Por isso a primeira coisa que `main()` faz é sequestrar o stdout.
+"""
+from __future__ import annotations
+
+import json
+import queue
+import sys
+import threading
+import traceback
+from pathlib import Path
+from typing import Any
+
+# ---------------------------------------------------------------------------
+# Canal de eventos. Capturado ANTES de qualquer import pesado, porque alguns
+# módulos imprimem já no import.
+#
+# No build do PyInstaller com `console=False` o Python pode entregar
+# sys.stdout/sys.stderr como None — não há console. Como o host nos dá pipes
+# de verdade, abrimos os descritores 1 e 2 na mão nesse caso. Sem isto o
+# backend funcionaria em dev e morreria calado no app empacotado.
+# ---------------------------------------------------------------------------
+def _fd_stream(fd: int, fallback_devnull: bool = True):
+    import io
+    import os
+
+    try:
+        return io.TextIOWrapper(
+            io.FileIO(fd, "w", closefd=False), encoding="utf-8", errors="replace"
+        )
+    except Exception:
+        if not fallback_devnull:
+            raise
+        return open(os.devnull, "w", encoding="utf-8")
+
+
+_CHANNEL = sys.stdout if sys.stdout is not None else _fd_stream(1)
+# Todo print() do pipeline vira log (stderr), nunca evento.
+sys.stdout = sys.stderr if sys.stderr is not None else _fd_stream(2)
+
+_write_lock = threading.Lock()
+
+
+def _emit(payload: dict[str, Any]) -> None:
+    """Escreve um evento no canal. Thread-safe e sempre com flush — o host
+    lê linha a linha e um buffer preso faria a barra de progresso travar."""
+    line = json.dumps(payload, ensure_ascii=False, default=str)
+    with _write_lock:
+        _CHANNEL.write(line + "\n")
+        _CHANNEL.flush()
+
+
+class _Cancelled(Exception):
+    """Cancelamento pedido pelo host."""
+
+
+class _CancelFlag:
+    """Sinalizador setado pela thread que lê o stdin."""
+
+    def __init__(self) -> None:
+        self._flag = threading.Event()
+
+    def set(self) -> None:
+        self._flag.set()
+
+    @property
+    def requested(self) -> bool:
+        return self._flag.is_set()
+
+
+def _stdin_is_pipe() -> bool:
+    """True quando o stdin é um pipe (o caso do host Electron), False quando
+    é arquivo redirecionado ou terminal.
+
+    Isto decide se o fim do stdin significa "o host morreu". Num pipe, sim:
+    a ponta de escrita sumiu junto com o processo pai. Num arquivo, EOF é só
+    o fim do arquivo — tratar isso como cancelamento fazia toda execução de
+    teste morrer na largada.
+    """
+    import os
+    import stat
+
+    try:
+        return stat.S_ISFIFO(os.fstat(_STDIN_FD).st_mode)
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Leitura de stdin pelo descritor cru.
+#
+# NUNCA use sys.stdin aqui. Uma thread bloqueada em `sys.stdin.readline()`
+# segura o lock interno do TextIOWrapper, e algo na cadeia de import de
+# app.pipeline toca sys.stdin — o import trava pra sempre. O sintoma é
+# cruel: o processo emite o primeiro evento e simplesmente congela, sem erro
+# e sem log. Medido: com a thread, o import não termina nem em 45s; sem ela,
+# 4,6s. `os.read` não passa pelo wrapper, então não há lock a disputar.
+# ---------------------------------------------------------------------------
+_STDIN_FD = 0
+_stdin_buffer = b""
+
+
+def _read_line_raw() -> str | None:
+    """Uma linha do fd 0, BLOQUEANTE. None em EOF ou erro.
+
+    Só pode ser usado antes dos imports pesados, com o processo ainda
+    single-thread (é o caso da leitura da requisição). Depois disso, use o
+    caminho por sondagem — ver `_stdin_available`.
+    """
+    global _stdin_buffer
+    import os
+
+    while True:
+        nl = _stdin_buffer.find(b"\n")
+        if nl >= 0:
+            line = _stdin_buffer[:nl]
+            _stdin_buffer = _stdin_buffer[nl + 1 :]
+            return line.decode("utf-8", errors="replace")
+        try:
+            chunk = os.read(_STDIN_FD, 65536)
+        except (OSError, ValueError):
+            return None
+        if not chunk:  # EOF
+            if _stdin_buffer:
+                rest = _stdin_buffer.decode("utf-8", errors="replace")
+                _stdin_buffer = b""
+                return rest
+            return None
+        _stdin_buffer += chunk
+
+
+def _stdin_available() -> int:
+    """Quantos bytes dá pra ler do stdin AGORA, sem bloquear. -1 = fechado.
+
+    Existe por causa de um deadlock do Windows: uma thread parada dentro de
+    uma leitura no fd 0 trava o carregamento de DLLs nativas no processo
+    inteiro. E o pipeline carrega DLL sob demanda o tempo todo (codecs, NVENC,
+    kernels de CUDA), então o travamento aparecia no meio da análise, sem erro
+    nem log. Medido: cortar 6 shots leva 3,2s sem a thread e NÃO TERMINA com
+    ela. Sondar e só ler quando há dado mantém a thread fora do kernel.
+    """
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    try:
+        handle = msvcrt.get_osfhandle(_STDIN_FD)
+    except OSError:
+        return -1
+    avail = wintypes.DWORD(0)
+    ok = ctypes.windll.kernel32.PeekNamedPipe(
+        wintypes.HANDLE(handle), None, 0, None, ctypes.byref(avail), None
+    )
+    if not ok:
+        return -1  # pipe fechado (o host morreu)
+    return int(avail.value)
+
+
+def _drain_stdin_lines() -> list[str] | None:
+    """Linhas completas disponíveis agora. None quando o pipe fecha."""
+    global _stdin_buffer
+    import os
+
+    avail = _stdin_available()
+    if avail < 0:
+        return None
+    if avail:
+        try:
+            _stdin_buffer += os.read(_STDIN_FD, avail)
+        except (OSError, ValueError):
+            return None
+
+    lines: list[str] = []
+    while True:
+        nl = _stdin_buffer.find(b"\n")
+        if nl < 0:
+            break
+        line = _stdin_buffer[:nl]
+        _stdin_buffer = _stdin_buffer[nl + 1 :]
+        lines.append(line.decode("utf-8", errors="replace"))
+    return lines
+
+
+def _detach_stdin() -> None:
+    """Aponta sys.stdin pro devnull depois de lermos a requisição.
+
+    Duas garantias: nada do pipeline consegue consumir bytes do nosso canal
+    de comandos, e qualquer biblioteca que resolva checar ou ler stdin recebe
+    um EOF imediato em vez de bloquear esperando digitação. O fd 0 continua
+    sendo o pipe — quem lê dele é só o `_read_line_raw`.
+    """
+    import os
+
+    try:
+        sys.stdin = open(os.devnull, "r", encoding="utf-8")
+    except Exception:
+        pass
+
+
+# Comandos que não são "cancel" vão pra esta fila. Quem lê o stdin é SÓ a
+# thread `_watch_stdin` — se o fluxo do batismo lesse o descritor em paralelo,
+# os dois roubariam linhas um do outro e o comando se perderia.
+_commands: "queue.Queue[dict[str, Any]]" = queue.Queue()
+
+
+def _watch_stdin(cancel: _CancelFlag) -> None:
+    """Thread daemon: única leitora do stdin, por SONDAGEM.
+
+    Nunca bloqueia dentro de uma leitura — ver `_stdin_available` pro porquê
+    (deadlock com o carregador de DLL do Windows). Um cancelamento demora no
+    máximo o intervalo da sondagem pra ser notado, o que é irrelevante perto
+    dos minutos que uma análise leva.
+
+    `cancel` é tratado na hora (precisa interromper o pipeline em voo); o
+    resto vira item na fila pra quem estiver esperando.
+    """
+    import time
+
+    orphan_means_cancel = _stdin_is_pipe()
+    while True:
+        try:
+            lines = _drain_stdin_lines()
+        except Exception:
+            break
+        if lines is None:  # pipe fechado
+            break
+        for raw in lines:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if msg.get("cmd") == "cancel":
+                cancel.set()
+                _commands.put({"cmd": "cancel"})
+                return
+            _commands.put(msg)
+        time.sleep(0.15)
+
+    # Pipe fechado = host sumiu. Não faz sentido seguir queimando GPU por uma
+    # janela que não existe mais.
+    if orphan_means_cancel:
+        cancel.set()
+        _commands.put({"cmd": "cancel"})
+
+
+# ---------------------------------------------------------------------------
+# probe: o que o host precisa saber antes de rodar qualquer coisa
+# ---------------------------------------------------------------------------
+def _probe() -> None:
+    from . import __version__
+    from .deps_check import cuda_available, ffmpeg_available, gpu_name
+
+    _emit(
+        {
+            "type": "probe",
+            "version": __version__,
+            "gpuName": gpu_name() if cuda_available() else None,
+            "ffmpeg": ffmpeg_available(),
+        }
+    )
+
+
+# ---------------------------------------------------------------------------
+# Consultas leves (sem torch) — respondem em ~0,15s, então o host pode chamar
+# a cada arquivo solto na janela sem travar a interface.
+# ---------------------------------------------------------------------------
+def _parse(path: str) -> None:
+    """Deduz anime/temporada/episódio do nome do arquivo, e devolve junto o
+    OP/ED salvo pra esse anime.
+
+    Fica aqui, e não reimplementado em TypeScript, porque a heurística tem
+    dezenas de padrões e fallback pelo nome da pasta — duas cópias divergiriam
+    na primeira vez que alguém corrigisse um caso e esquecesse a outra.
+    """
+    from .config import Config
+    from .storage.skip_ranges import SkipRangesStore
+    from .video_ingest import parse_filename
+
+    info = parse_filename(path)
+    head, tail = 0.0, 0.0
+    try:
+        store = SkipRangesStore(Config.load().cache_path)
+        head, tail = store.get(info.anime)
+    except Exception:
+        pass
+
+    _emit(
+        {
+            "type": "parsed",
+            "anime": info.anime,
+            "season": info.season,
+            "episode": info.episode,
+            "skipHeadSeconds": head,
+            "skipTailSeconds": tail,
+        }
+    )
+
+
+def _backfill_episode_roots(db: Any, output_dir: Path) -> None:
+    """Descobre a pasta de saída de episódios analisados ANTES da coluna
+    `output_root` existir.
+
+    Não dá pra reconstruir o caminho pelo título do banco: a pasta usa o nome
+    que o usuário DIGITOU, e o banco guarda o título resolvido pela AniList
+    (que costuma ser diferente — "Mushoku Tensei" vira "Mushoku Tensei III:
+    Isekai Ittara Honki Dasu"). Então procuramos no disco: qualquer
+    `<saída>/*/S01E41` serve, e só aceitamos quando há UMA candidata — com
+    duas, adivinhar erraria em silêncio.
+    """
+    if not output_dir.is_dir():
+        return
+    with db.connect() as c:
+        rows = c.execute(
+            "SELECT id, season, episode FROM episode WHERE output_root IS NULL"
+        ).fetchall()
+        for row in rows:
+            slug = f"S{int(row['season']):02d}E{int(row['episode']):02d}"
+            matches = [p for p in output_dir.glob(f"*/{slug}") if (p / "metadata").is_dir()]
+            if len(matches) == 1:
+                c.execute(
+                    "UPDATE episode SET output_root=? WHERE id=?",
+                    (str(matches[0]), row["id"]),
+                )
+
+
+def _recent() -> None:
+    """Episódios já analisados, pro usuário reabrir sem reprocessar."""
+    from .config import Config
+    from .storage.db import Database
+
+    cfg = Config.load()
+    db = Database(cfg.cache_path / "index.db")
+    try:
+        _backfill_episode_roots(db, cfg.output_path)
+    except Exception:
+        pass  # backfill é oportunista: falhar aqui não pode derrubar a lista
+
+    episodes = []
+    for e in db.recent_episodes(30):
+        root = Path(e["output_root"])
+        if not root.is_dir():
+            continue  # pasta apagada por fora: não oferece o que não abre
+        episodes.append(
+            {
+                "episodeId": e["id"],
+                "animeTitle": e["anime_title"],
+                "season": e["season"],
+                "episode": e["episode"],
+                "episodeRoot": str(root),
+                "shotCount": e["shot_count"],
+                "processedAt": e["processed_at"],
+            }
+        )
+    _emit({"type": "recent", "episodes": episodes})
+
+
+def _results(episode_id: int) -> None:
+    """Personagens do episódio, com a contagem de cenas de cada um."""
+    from .config import Config
+    from .storage.db import Database
+
+    cfg = Config.load()
+    db = Database(cfg.cache_path / "index.db")
+
+    with db.connect() as c:
+        ep = c.execute(
+            "SELECT e.id, e.season, e.episode, e.output_root, e.anime_id, "
+            "       a.title AS anime_title "
+            "FROM episode e JOIN anime a ON a.id = e.anime_id WHERE e.id=?",
+            (episode_id,),
+        ).fetchone()
+    if ep is None:
+        _emit({"type": "failed", "message": f"episódio {episode_id} não encontrado"})
+        return
+
+    characters = []
+    for ch in db.get_characters_for_anime(ep["anime_id"]):
+        shots = db.shots_for_character(ch["id"], episode_id=episode_id)
+        if not shots:
+            continue
+        characters.append(
+            {"id": ch["id"], "name": ch["name"], "shotCount": len(shots)}
+        )
+    characters.sort(key=lambda c: -c["shotCount"])
+
+    _emit(
+        {
+            "type": "results",
+            "episodeId": ep["id"],
+            "animeTitle": ep["anime_title"],
+            "season": ep["season"],
+            "episode": ep["episode"],
+            "episodeRoot": ep["output_root"],
+            "totalShots": len(db.shots_for_episode(episode_id)),
+            "characters": characters,
+        }
+    )
+
+
+def _shots(episode_id: int, character_id: int) -> None:
+    """Cenas de um personagem, com caminho do keyframe e do clipe."""
+    from .config import Config
+    from .storage.db import Database
+
+    cfg = Config.load()
+    db = Database(cfg.cache_path / "index.db")
+    rows = db.shots_for_character(character_id, episode_id=episode_id)
+    _emit(
+        {
+            "type": "shots",
+            "shots": [
+                {
+                    "id": r["id"],
+                    "idx": r["idx"],
+                    "file": r["file"],
+                    "keyframe": r["keyframe"],
+                    "start": r["start"],
+                    "end": r["end"],
+                    "duration": r["duration"],
+                    "confidence": r["confidence"],
+                    "approved": r["approved"],
+                }
+                for r in rows
+            ],
+        }
+    )
+
+
+def _has_analysis(source: str, anime: str, season: int, episode: int) -> None:
+    """Este episódio já tem resultado salvo?
+
+    A interface usa isso pra perguntar "substituir ou somar" ANTES de rodar —
+    sem a pergunta, uma reanálise apagaria em silêncio a curadoria manual do
+    usuário (remoções e movimentações feitas na mão).
+    """
+    from .config import Config
+    from .storage.db import Database
+
+    exists = False
+    try:
+        db = Database(Config.load().cache_path / "index.db")
+        exists = db.has_analysis(source, anime, season, episode)
+    except Exception:
+        pass
+    _emit({"type": "has-analysis", "exists": exists})
+
+
+def _skip_ranges(anime: str) -> None:
+    """OP/ED salvos pra um anime (o usuário digitou o nome na mão)."""
+    from .config import Config
+    from .storage.skip_ranges import SkipRangesStore
+
+    head, tail = 0.0, 0.0
+    try:
+        head, tail = SkipRangesStore(Config.load().cache_path).get(anime)
+    except Exception:
+        pass
+    _emit({"type": "skip-ranges", "skipHeadSeconds": head, "skipTailSeconds": tail})
+
+
+# ---------------------------------------------------------------------------
+# run: a análise em si
+# ---------------------------------------------------------------------------
+def _read_request() -> dict[str, Any]:
+    line = _read_line_raw()
+    if line is None or not line.strip():
+        raise ValueError("requisição vazia no stdin")
+    req = json.loads(line)
+    if not isinstance(req, dict):
+        raise ValueError("requisição deve ser um objeto JSON")
+    return req
+
+
+def _apply_request_to_config(cfg: Any, req: dict[str, Any]) -> None:
+    """Passa os parâmetros da requisição pra Config.
+
+    Não salvamos no disco aqui: quem manda no config.json é o host (o Electron
+    grava direto no mesmo arquivo). Se salvássemos dos dois lados, um
+    sobrescreveria o outro dependendo de quem terminasse por último.
+    """
+    params = req.get("params") or {}
+    cfg.output_dir = req["outputDir"]
+    cfg.last_anime = req["anime"]
+    cfg.last_season = int(req["season"])
+    cfg.last_episode = int(req["episode"])
+    if "threshold" in params:
+        cfg.default_threshold = float(params["threshold"])
+    if "margin" in params:
+        cfg.argmax_margin = float(params["margin"])
+    if "minShots" in params:
+        cfg.min_shots_per_character = int(params["minShots"])
+    if "padding" in params:
+        cfg.face_crop_padding = float(params["padding"])
+    if "credit" in params:
+        cfg.credit_edge_threshold = float(params["credit"])
+    cfg.skip_credit_shots = bool(req.get("skipCreditShots", False))
+    cfg.use_danbooru = bool(req.get("useDanbooru", False))
+
+
+def _result_payload(result: Any) -> dict[str, Any]:
+    return {
+        "episodeRoot": str(result.episode_root),
+        "totalShots": result.total_shots,
+        "totalCharacters": result.total_characters,
+        "identifiedCharacters": list(result.identified_characters),
+        "lowRefsWarning": result.low_refs_warning,
+        "refsDir": result.refs_dir,
+        "animeTitle": result.anime_title,
+        "season": result.season,
+        "episode": result.episode,
+        "episodeId": result.episode_id,
+    }
+
+
+def _run() -> int:
+    req = _read_request()
+    # Depois de ter a requisição, ninguém mais deve enxergar o pipe como
+    # stdin (ver _detach_stdin).
+    _detach_stdin()
+    cancel = _CancelFlag()
+    # Pode subir ANTES dos imports pesados porque agora ela sonda em vez de
+    # bloquear — assim o cancelamento já vale durante os ~5s de carga do
+    # torch. Com leitura bloqueante isto travava o processo (ver
+    # `_stdin_available`).
+    threading.Thread(target=_watch_stdin, args=(cancel,), daemon=True).start()
+
+    from .config import Config
+    from .pipeline_types import AIMode, AnimeNotFoundError, InsufficientRefsError
+    from .video_ingest import EpisodeInfo
+
+    cfg = Config.load()
+    _apply_request_to_config(cfg, req)
+    cfg.ensure_dirs()
+
+    info = EpisodeInfo(
+        anime=req["anime"],
+        season=int(req["season"]),
+        episode=int(req["episode"]),
+        source=Path(req["videoPath"]),
+        skip_head_seconds=float(req.get("skipHeadSeconds", 0)),
+        skip_tail_seconds=float(req.get("skipTailSeconds", 0)),
+    )
+
+    import time
+
+    t0 = time.perf_counter()
+
+    def on_progress(stage: str, frac: float, msg: str) -> None:
+        if cancel.requested:
+            raise _Cancelled()
+        _emit(
+            {
+                "type": "stage",
+                "stage": stage,
+                "fraction": float(frac),
+                "message": str(msg),
+                "elapsed": round(time.perf_counter() - t0, 2),
+            }
+        )
+
+    try:
+        # Avisa antes do import pesado: o primeiro run da sessão paga ~5s de
+        # torch e sem isto a interface parece travada. Fica DENTRO do try —
+        # um cancelamento aqui é cancelamento, não falha.
+        on_progress(
+            "parse", -1.0, "Preparando ambiente de análise (só na primeira vez)..."
+        )
+
+        from .pipeline import Pipeline  # noqa: WPS433 — pesado de propósito
+
+        pipeline = Pipeline(cfg)
+
+        if req.get("discovery"):
+            disc = pipeline.run_discovery(info, on_progress=on_progress)
+            return _discovery_naming_round(pipeline, disc, on_progress, cancel)
+
+        result = pipeline.run(
+            info,
+            on_progress=on_progress,
+            use_ai_recognition=False,
+            ai_mode=AIMode.FULL,
+            ai_review_ambiguous=bool(req.get("aiReview", False)),
+            merge_previous=bool(req.get("mergePrevious", False)),
+        )
+    except _Cancelled:
+        _emit({"type": "cancelled"})
+        return 0
+    except AnimeNotFoundError as e:
+        _emit({"type": "needs-input", "kind": "anime-not-found", "message": str(e)})
+        return 0
+    except InsufficientRefsError as e:
+        _emit(
+            {
+                "type": "needs-input",
+                "kind": "refs-missing",
+                "message": str(e),
+                "refsDir": e.refs_dir,
+            }
+        )
+        return 0
+
+    # Telemetria por etapa: o pipeline já grava timings.json na pasta do
+    # episódio (StageTimer). Lemos de volta em vez de recalcular, pra ser
+    # exatamente o mesmo número que vai pro log.
+    timings = _read_timings(Path(result.episode_root))
+    if timings:
+        _emit({"type": "timings", **timings})
+
+    _emit({"type": "done", "result": _result_payload(result)})
+    return 0
+
+
+def _discovery_naming_round(
+    pipeline: Any, disc: Any, on_progress: Any, cancel: _CancelFlag
+) -> int:
+    """Descoberta: publica os grupos, ESPERA os nomes e faz o commit.
+
+    O `DiscoveryResult` carrega bytes de JPEG e o embedding do centroide em
+    memória — não dá pra serializar e recriar depois. Então o processo fica
+    vivo entre a descoberta e o batismo, exatamente como o app Qt fazia
+    dentro de uma thread. Os recortes vão pro disco e o host os exibe por
+    `media://`; mandar base64 no canal de eventos inflaria o JSON em dezenas
+    de megabytes.
+    """
+    # 1) Grava os recortes que a tela de batismo vai mostrar.
+    crops_dir = Path(disc.episode_root) / "metadata" / "discovery"
+    crops_dir.mkdir(parents=True, exist_ok=True)
+    for old in crops_dir.glob("*.jpg"):
+        old.unlink(missing_ok=True)  # sobras de uma descoberta anterior
+
+    groups_payload = []
+    for g in disc.groups:
+        crop_files = []
+        for i, jpg in enumerate(g.ref_crops_jpg):
+            name = f"g{g.key:03d}_{i:03d}.jpg"
+            (crops_dir / name).write_bytes(jpg)
+            crop_files.append(f"metadata/discovery/{name}")
+        groups_payload.append(
+            {
+                "key": g.key,
+                "faces": g.n_faces,
+                "shots": g.n_shots,
+                # Índice em ref_crops_jpg == índice nesta lista: é o que o
+                # host devolve em `removed`.
+                "crops": crop_files,
+                "suggestedName": g.suggested_name,
+                "suggestedSim": round(g.suggested_sim, 3),
+            }
+        )
+
+    _emit(
+        {
+            "type": "discovery-ready",
+            "episodeRoot": str(disc.episode_root),
+            "animeTitle": disc.anime_title,
+            "season": disc.season,
+            "episode": disc.episode,
+            "totalFaces": disc.total_faces,
+            "online": disc.online,
+            "roster": list(disc.roster),
+            "groups": groups_payload,
+        }
+    )
+
+    # 2) Espera o batismo, pela fila alimentada pela thread de stdin. O host
+    #    manda:
+    #      {"cmd":"commit-discovery","names":{"0":"Rimuru"},"removed":{"0":[2]}}
+    #    ou {"cmd":"cancel"} pra desistir.
+    #
+    #    Sem timeout de propósito: o usuário pode levar o tempo que quiser
+    #    batizando dezenas de grupos. Se a janela fechar, o pipe quebra, a
+    #    thread põe "cancel" na fila e saímos.
+    while True:
+        msg = _commands.get()
+        cmd = msg.get("cmd")
+        if cmd == "cancel" or cancel.requested:
+            _emit({"type": "cancelled"})
+            return 0
+        if cmd == "commit-discovery":
+            names = {int(k): str(v) for k, v in (msg.get("names") or {}).items()}
+            removed = {
+                int(k): [int(i) for i in v]
+                for k, v in (msg.get("removed") or {}).items()
+            }
+            break
+
+    # 3) Commit: cria personagens, atribui shots e salva as refs.
+    result = pipeline.commit_discovery(
+        disc, names, on_progress=on_progress, removed=removed
+    )
+    timings = _read_timings(Path(result.episode_root))
+    if timings:
+        _emit({"type": "timings", **timings})
+    _emit({"type": "done", "result": _result_payload(result)})
+    return 0
+
+
+def _read_timings(episode_root: Path) -> dict[str, Any] | None:
+    path = episode_root / "metadata" / "timings.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return {
+        "totalSeconds": data.get("total_seconds", 0),
+        "stages": data.get("stages", {}),
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    mode = args[0] if args else "run"
+    try:
+        if mode == "probe":
+            _probe()
+            return 0
+        if mode == "parse":
+            _parse(args[1])
+            return 0
+        if mode == "skip-ranges":
+            _skip_ranges(args[1])
+            return 0
+        if mode == "has-analysis":
+            _has_analysis(args[1], args[2], int(args[3]), int(args[4]))
+            return 0
+        if mode == "recent":
+            _recent()
+            return 0
+        if mode == "results":
+            _results(int(args[1]))
+            return 0
+        if mode == "shots":
+            _shots(int(args[1]), int(args[2]))
+            return 0
+        if mode == "run":
+            return _run()
+        _emit({"type": "failed", "message": f"modo desconhecido: {mode}"})
+        return 2
+    except Exception as e:  # noqa: BLE001 — a fronteira do processo
+        _emit(
+            {
+                "type": "failed",
+                "message": str(e) or type(e).__name__,
+                "detail": traceback.format_exc(),
+            }
+        )
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
