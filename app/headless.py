@@ -514,6 +514,10 @@ def _apply_request_to_config(cfg: Any, req: dict[str, Any]) -> None:
         cfg.credit_edge_threshold = float(params["credit"])
     cfg.skip_credit_shots = bool(req.get("skipCreditShots", False))
     cfg.use_danbooru = bool(req.get("useDanbooru", False))
+    mode = str(req.get("renderExportMode", "off"))
+    # Valor desconhecido cai em "off" de propósito: um modo inventado não pode
+    # virar formato de saída silencioso.
+    cfg.render_export_mode = mode if mode in ("off", "compat", "intra") else "off"
 
 
 def _result_payload(result: Any) -> dict[str, Any]:

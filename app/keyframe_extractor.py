@@ -28,8 +28,13 @@ def cut_shot(
     reencode: bool = True,
     use_nvenc: bool = False,
     fps: float = 24.0,
+    render_mode: str = "off",
 ) -> None:
     """Extract a shot to an mp4 file. Re-encode for frame accuracy, or stream-copy for speed.
+
+    `render_mode` controla o formato de saída (ver config.render_export_mode):
+    "off" mantém o comportamento antigo, "compat" força 8 bits e 23,976 CFR,
+    "intra" acrescenta all-intra pra seek quadro a quadro sair barato.
 
     Overwrites any existing file at `out_file`.
     """
@@ -49,43 +54,90 @@ def cut_shot(
     # último frame legítimo nunca sai (ele termina 1 frame inteiro antes).
     duration = max(0.05, shot.duration - 0.5 / max(fps, 1.0))
 
+    render = render_mode in ("compat", "intra")
+
+    # Opções comuns aos dois encoders nos modos de render. O filtro fps com
+    # fps_mode=cfr entrega cadência constante de 23,976: medido em 2,0s de
+    # corte → 48 frames (esperado 47,95), nenhum duplicado, mesmo com o -ss
+    # vindo ANTES do -i.
+    common: dict[str, object] = {}
+    if render:
+        common = {"vf": "fps=24000/1001", "fps_mode": "cfr", "profile:v": "high"}
+
     if reencode:
         if use_nvenc:
             # GPU encode chip: ~5-10x faster than libx264 on CPU and leaves
-            # the CPU free for parallel decode/keyframes. rc=vbr + cq + b:v 0
-            # is NVENC's constant-quality mode (the crf equivalent).
+            # the CPU free for parallel decode/keyframes.
+            if render:
+                # constqp é o "CRF" do NVENC: qualidade fixa, sem alvo de
+                # bitrate — o certo pra material que ainda vai ser reprocessado.
+                rate: dict[str, object] = {"rc": "constqp", "qp": 20}
+            else:
+                # rc=vbr + cq + b:v 0 é o modo de qualidade constante antigo.
+                rate = {"rc": "vbr", "cq": 23, "b:v": "0"}
+            if render_mode == "intra":
+                # ATENÇÃO: aqui é -g 0 e no libx264 abaixo é -g 1. NÃO é erro
+                # de digitação, não "conserte" pra ficarem iguais. O NVENC
+                # rejeita -g 1 com "Gop Length should be greater than number
+                # of B frames + 1" — mesmo com -bf 0 ele exige GOP >= 2.
+                # Medido nesta máquina (RTX 3060), 72 frames:
+                #   -g 1 -bf 0 → falha, não gera arquivo
+                #   -g 2 -bf 0 → 36/72 keyframes
+                #   -g 0 -bf 0 → 72/72 keyframes  ✓
+                rate.update({"g": 0, "bf": 0})
+
             stream = ffmpeg.input(str(video_path), ss=shot.start).output(
                 str(out_file),
                 t=duration,
                 vcodec="h264_nvenc",
                 preset="p4",
-                rc="vbr",
-                cq=23,
                 # OBRIGATÓRIO: o NVENC de H.264 não codifica 10 bits e falha
                 # com "10 bit encode not supported / No capable devices".
                 # Boa parte dos fansubs de anime é 10-bit (x265 Main 10), então
                 # SEM isto o NVENC nunca entra: toda análise caía no fallback
                 # de CPU sem avisar, e o corte virava 32% do tempo total.
-                # Os clipes são prévias de edição — 8 bits é de sobra, e H.264
-                # 8-bit ainda é o formato mais compatível.
                 pix_fmt="yuv420p",
                 acodec="aac",
                 format="mp4",
                 movflags="+faststart",
                 loglevel="error",
-                **{"b:v": "0"},
+                **rate,
+                **common,
             )
         else:
+            x264: dict[str, object] = {}
+            if render:
+                # ultrafast NÃO entrega High: ele desliga CABAC e 8x8dct, e o
+                # x264 rebaixa a saída pra Constrained Baseline mesmo com
+                # -profile:v high. Medido: superfast custa 8% mais tempo e
+                # gera arquivo 33% MENOR (4,46 MB contra 6,67 MB).
+                x264["preset"] = "superfast"
+            else:
+                x264["preset"] = "ultrafast"
+            if render_mode == "intra":
+                # No x264 é -g 1 mesmo (todo frame IDR). Ver o comentário do
+                # NVENC acima pra entender por que os dois números diferem.
+                x264.update({"g": 1, "bf": 0})
+
             stream = ffmpeg.input(str(video_path), ss=shot.start).output(
                 str(out_file),
                 t=duration,
                 vcodec="libx264",
-                preset="ultrafast",
                 crf=20,
+                # Sem isto o libx264 HERDA o formato da fonte: episódio 10-bit
+                # gerava clipe High 10 (verificado). H.264 High 10 não é
+                # decodificado por WebCodecs nem pelo NVDEC da maioria das
+                # placas, então esses clipes caem em decode por software no
+                # pipeline de render. Vale SEMPRE, não só nos modos de render —
+                # senão o fallback de CPU produz saída incompatível no meio de
+                # um episódio que começou na GPU.
+                pix_fmt="yuv420p",
                 acodec="aac",
                 format="mp4",
                 movflags="+faststart",
                 loglevel="error",
+                **x264,
+                **common,
             )
     else:
         stream = ffmpeg.input(str(video_path), ss=shot.start, to=shot.end).output(
@@ -142,6 +194,7 @@ def cut_all_shots(
     reencode: bool,
     on_progress: Callable[[int, int, int], None] | None = None,
     skip_existing: bool = True,
+    render_mode: str = "off",
 ) -> list[tuple[ShotBounds, Path, list[Path]]]:
     """Cut shots and extract keyframes, several shots at a time.
 
@@ -159,6 +212,33 @@ def cut_all_shots(
     """
     shots_dir.mkdir(parents=True, exist_ok=True)
     keyframes_dir.mkdir(parents=True, exist_ok=True)
+
+    # Clipe cortado noutro modo tem OUTRO formato, então reaproveitá-lo do
+    # cache faria ligar a opção não mudar nada — o pior tipo de falha, a
+    # silenciosa. O modo usado fica gravado ao lado dos clipes; se mudou,
+    # todos são recortados.
+    stamp = shots_dir / ".export_mode"
+    try:
+        previous = stamp.read_text(encoding="utf-8").strip()
+    except OSError:
+        # Sem marcador: ou é a primeira análise, ou os clipes vêm de uma versão
+        # anterior a esta opção. Nos dois casos "off" é a suposição correta.
+        previous = "off"
+    if previous != render_mode:
+        skip_existing = False
+        if any(shots_dir.glob("*.mp4")):
+            print(
+                # Sem "→" nem travessão: o console do Windows é cp1252 e
+                # estoura com UnicodeEncodeError em caractere fora dela,
+                # derrubando a análise inteira por causa de um log.
+                f"[CorteCenas] Formato de export mudou ({previous} -> {render_mode})"
+                " - recortando os clipes",
+                flush=True,
+            )
+    try:
+        stamp.write_text(render_mode, encoding="utf-8")
+    except OSError:
+        pass  # marcador é otimização, não pode derrubar a análise
 
     # fps do vídeo, sondado uma vez: o corte usa meia duração de frame como
     # margem pra não deixar o primeiro frame do shot seguinte vazar pro clipe.
@@ -186,7 +266,8 @@ def cut_all_shots(
         if not (skip_existing and have_cut):
             try:
                 cut_shot(video_path, shot, out_file, reencode=reencode,
-                         use_nvenc=enc_state["nvenc"], fps=video_fps)
+                         use_nvenc=enc_state["nvenc"], fps=video_fps,
+                         render_mode=render_mode)
             except ffmpeg.Error:
                 if enc_state["nvenc"]:
                     enc_state["nvenc"] = False
@@ -197,7 +278,8 @@ def cut_all_shots(
                     )
                     try:
                         cut_shot(video_path, shot, out_file, reencode=reencode,
-                                 use_nvenc=False, fps=video_fps)
+                                 use_nvenc=False, fps=video_fps,
+                                 render_mode=render_mode)
                     except ffmpeg.Error:
                         return None
                 else:

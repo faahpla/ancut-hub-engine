@@ -1703,6 +1703,7 @@ class Pipeline:
             keyframes_per_shot=cfg.keyframes_per_shot,
             reencode=cfg.reencode_shots,
             on_progress=cut_cb,
+            render_mode=cfg.render_export_mode,
         )
         return episode_root, metadata_dir, cut_results
 

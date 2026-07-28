@@ -92,6 +92,19 @@ class Config:
 
     # Cutting
     reencode_shots: bool = True
+    # Formato de saída dos clipes. Separado em dois níveis DE PROPÓSITO, pra
+    # dar pra medir um sem o outro:
+    #
+    #   "off"     como sempre foi
+    #   "compat"  8 bits + 23,976 CFR. H.264 High 10 não é decodificado pelo
+    #             WebCodecs nem pelo NVDEC da maioria das placas, então clipe
+    #             10-bit cai em decode por software no pipeline de render.
+    #   "intra"   compat + todo frame keyframe (seek quadro a quadro barato).
+    #             Custa ~1,84x de tamanho de arquivo.
+    #
+    # Se "compat" já resolver o gargalo, "intra" fica desnecessário e o
+    # arquivo continua pequeno.
+    render_export_mode: str = "off"
 
     # Keyframes per shot used for recognition
     keyframes_per_shot: int = 3
