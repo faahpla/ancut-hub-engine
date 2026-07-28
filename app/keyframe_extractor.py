@@ -205,6 +205,8 @@ def cut_all_shots(
 
     If `skip_existing` is True, shots whose .mp4 is already on disk (non-empty)
     are not re-encoded, and keyframes already present are not re-extracted.
+    Trocar `render_mode` invalida só os clipes: os keyframes vêm do vídeo
+    original e não mudam de formato junto.
 
     `on_progress` is called from THIS thread as results complete (completion
     order, monotonic count) — raising from it (PipelineCancelled) cancels all
@@ -224,8 +226,12 @@ def cut_all_shots(
         # Sem marcador: ou é a primeira análise, ou os clipes vêm de uma versão
         # anterior a esta opção. Nos dois casos "off" é a suposição correta.
         previous = "off"
+    # Só os CLIPES perdem a validade. Os keyframes são extraídos do vídeo
+    # original, não do clipe, então o formato de export não os afeta — jogá-los
+    # fora junto custaria milhares de decodificações à toa.
+    reuse_cuts = skip_existing
     if previous != render_mode:
-        skip_existing = False
+        reuse_cuts = False
         if any(shots_dir.glob("*.mp4")):
             print(
                 # Sem "→" nem travessão: o console do Windows é cp1252 e
@@ -263,7 +269,7 @@ def cut_all_shots(
         have_cut = out_file.exists() and out_file.stat().st_size > 0
         have_kfs = all(p.exists() and p.stat().st_size > 0 for p in expected_kfs)
 
-        if not (skip_existing and have_cut):
+        if not (reuse_cuts and have_cut):
             try:
                 cut_shot(video_path, shot, out_file, reencode=reencode,
                          use_nvenc=enc_state["nvenc"], fps=video_fps,
@@ -290,7 +296,9 @@ def cut_all_shots(
         else:
             kfs = extract_keyframes(video_path, shot, keyframes_dir, n_frames=keyframes_per_shot)
 
-        return shot, out_file, kfs, (skip_existing and have_cut and have_kfs)
+        # "Pulado" no contador de progresso significa que NADA foi refeito —
+        # com o formato trocado o clipe é recortado, então não conta.
+        return shot, out_file, kfs, (reuse_cuts and have_cut and skip_existing and have_kfs)
 
     indexed: list[tuple[ShotBounds, Path, list[Path]] | None] = [None] * total
     done = 0
