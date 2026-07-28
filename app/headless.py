@@ -384,7 +384,7 @@ def _results(episode_id: int) -> None:
     with db.connect() as c:
         ep = c.execute(
             "SELECT e.id, e.season, e.episode, e.output_root, e.anime_id, "
-            "       a.title AS anime_title "
+            "       a.title AS anime_title, a.anilist_id, a.mal_id "
             "FROM episode e JOIN anime a ON a.id = e.anime_id WHERE e.id=?",
             (episode_id,),
         ).fetchone()
@@ -412,8 +412,51 @@ def _results(episode_id: int) -> None:
             "episodeRoot": ep["output_root"],
             "totalShots": len(db.shots_for_episode(episode_id)),
             "characters": characters,
+            "refsDir": _refs_dir_for(cfg, ep["anilist_id"], ep["mal_id"]),
         }
     )
+
+
+def _franchise_cache_id(cfg: Any, anilist_id: int | None, mal_id: int | None) -> str | None:
+    """Pasta de refs da FRANQUIA, não da temporada.
+
+    As refs de todas as temporadas moram juntas sob o id raiz da franquia, e o
+    episódio só conhece o id da própria temporada. Por isso varre os
+    metadata.json procurando quem lista este anilist_id entre os da franquia —
+    é o único jeito de achar a raiz partindo de uma temporada irmã.
+
+    Portado do app Qt (results_tab._resolve_franchise_cache_id), onde já estava
+    provado contra as duas convenções de nome de pasta: `al<id>` antiga e
+    `<título> [al<id>]` atual.
+    """
+    import json as _json
+
+    root_dir = cfg.cache_path / "anime_db"
+    if not root_dir.exists():
+        return None
+    if anilist_id:
+        for p in root_dir.glob("*/metadata.json"):
+            try:
+                d = _json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if anilist_id == d.get("anilist_id") or anilist_id in (d.get("franchise_ids") or []):
+                root = d.get("franchise_root_id") or d.get("anilist_id")
+                if root:
+                    return f"al{root}"
+        return f"al{anilist_id}"
+    if mal_id:
+        return f"mal{mal_id}"
+    return None
+
+
+def _refs_dir_for(cfg: Any, anilist_id: int | None, mal_id: int | None) -> str | None:
+    cache_id = _franchise_cache_id(cfg, anilist_id, mal_id)
+    if not cache_id:
+        return None
+    from .references.reference_store import resolve_anime_dir
+
+    return str(resolve_anime_dir(cfg.cache_path, cache_id) / "characters")
 
 
 def _shots(episode_id: int, character_id: int) -> None:
