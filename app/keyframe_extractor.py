@@ -21,6 +21,47 @@ _NVENC_WORKERS = 3
 _CPU_WORKERS = 4
 
 
+def render_output_params(render_mode: str, use_nvenc: bool) -> dict[str, object]:
+    """Parâmetros de saída do ffmpeg para um modo de export.
+
+    FONTE ÚNICA de propósito: o corte e o merge precisam produzir exatamente o
+    mesmo formato. Mesclar com outros parâmetros desfaz a garantia que o modo
+    dá — medido: emendar sem reencodar quebra o CFR (salto de 0,062s na
+    junção, contra os 0,042s de um frame) e o r_frame_rate vai pra 47,95.
+    """
+    render = render_mode in ("compat", "intra")
+    p: dict[str, object] = {
+        # OBRIGATÓRIO nos dois encoders: o NVENC de H.264 não codifica 10 bits
+        # e o libx264 HERDA o formato da fonte se ninguém disser nada.
+        "pix_fmt": "yuv420p",
+        "acodec": "aac",
+        "format": "mp4",
+        "movflags": "+faststart",
+    }
+    if render:
+        p |= {"vf": "fps=24000/1001", "fps_mode": "cfr", "profile:v": "high"}
+
+    if use_nvenc:
+        p |= {"vcodec": "h264_nvenc", "preset": "p4"}
+        # constqp é o "CRF" do NVENC; vbr+cq era o modo antigo.
+        p |= {"rc": "constqp", "qp": 20} if render else {"rc": "vbr", "cq": 23, "b:v": "0"}
+        if render_mode == "intra":
+            # ATENÇÃO: -g 0 aqui e -g 1 no libx264 abaixo. NÃO é erro de
+            # digitação, não "conserte" pra ficarem iguais. O NVENC rejeita
+            # -g 1 com "Gop Length should be greater than number of B frames
+            # + 1" — mesmo com -bf 0 exige GOP >= 2. Medido na RTX 3060, 72
+            # frames: -g 1 falha, -g 2 dá 36/72, -g 0 dá 72/72.
+            p |= {"g": 0, "bf": 0}
+    else:
+        p |= {"vcodec": "libx264", "crf": 20}
+        # ultrafast NÃO entrega High: desliga CABAC e 8x8dct e o x264 rebaixa
+        # pra Constrained Baseline. superfast custa 8% de tempo e sai 33% menor.
+        p["preset"] = "superfast" if render else "ultrafast"
+        if render_mode == "intra":
+            p |= {"g": 1, "bf": 0}
+    return p
+
+
 def cut_shot(
     video_path: str | Path,
     shot: ShotBounds,
@@ -54,91 +95,16 @@ def cut_shot(
     # último frame legítimo nunca sai (ele termina 1 frame inteiro antes).
     duration = max(0.05, shot.duration - 0.5 / max(fps, 1.0))
 
-    render = render_mode in ("compat", "intra")
-
-    # Opções comuns aos dois encoders nos modos de render. O filtro fps com
-    # fps_mode=cfr entrega cadência constante de 23,976: medido em 2,0s de
-    # corte → 48 frames (esperado 47,95), nenhum duplicado, mesmo com o -ss
-    # vindo ANTES do -i.
-    common: dict[str, object] = {}
-    if render:
-        common = {"vf": "fps=24000/1001", "fps_mode": "cfr", "profile:v": "high"}
-
     if reencode:
-        if use_nvenc:
-            # GPU encode chip: ~5-10x faster than libx264 on CPU and leaves
-            # the CPU free for parallel decode/keyframes.
-            if render:
-                # constqp é o "CRF" do NVENC: qualidade fixa, sem alvo de
-                # bitrate — o certo pra material que ainda vai ser reprocessado.
-                rate: dict[str, object] = {"rc": "constqp", "qp": 20}
-            else:
-                # rc=vbr + cq + b:v 0 é o modo de qualidade constante antigo.
-                rate = {"rc": "vbr", "cq": 23, "b:v": "0"}
-            if render_mode == "intra":
-                # ATENÇÃO: aqui é -g 0 e no libx264 abaixo é -g 1. NÃO é erro
-                # de digitação, não "conserte" pra ficarem iguais. O NVENC
-                # rejeita -g 1 com "Gop Length should be greater than number
-                # of B frames + 1" — mesmo com -bf 0 ele exige GOP >= 2.
-                # Medido nesta máquina (RTX 3060), 72 frames:
-                #   -g 1 -bf 0 → falha, não gera arquivo
-                #   -g 2 -bf 0 → 36/72 keyframes
-                #   -g 0 -bf 0 → 72/72 keyframes  ✓
-                rate.update({"g": 0, "bf": 0})
-
-            stream = ffmpeg.input(str(video_path), ss=shot.start).output(
-                str(out_file),
-                t=duration,
-                vcodec="h264_nvenc",
-                preset="p4",
-                # OBRIGATÓRIO: o NVENC de H.264 não codifica 10 bits e falha
-                # com "10 bit encode not supported / No capable devices".
-                # Boa parte dos fansubs de anime é 10-bit (x265 Main 10), então
-                # SEM isto o NVENC nunca entra: toda análise caía no fallback
-                # de CPU sem avisar, e o corte virava 32% do tempo total.
-                pix_fmt="yuv420p",
-                acodec="aac",
-                format="mp4",
-                movflags="+faststart",
-                loglevel="error",
-                **rate,
-                **common,
-            )
-        else:
-            x264: dict[str, object] = {}
-            if render:
-                # ultrafast NÃO entrega High: ele desliga CABAC e 8x8dct, e o
-                # x264 rebaixa a saída pra Constrained Baseline mesmo com
-                # -profile:v high. Medido: superfast custa 8% mais tempo e
-                # gera arquivo 33% MENOR (4,46 MB contra 6,67 MB).
-                x264["preset"] = "superfast"
-            else:
-                x264["preset"] = "ultrafast"
-            if render_mode == "intra":
-                # No x264 é -g 1 mesmo (todo frame IDR). Ver o comentário do
-                # NVENC acima pra entender por que os dois números diferem.
-                x264.update({"g": 1, "bf": 0})
-
-            stream = ffmpeg.input(str(video_path), ss=shot.start).output(
-                str(out_file),
-                t=duration,
-                vcodec="libx264",
-                crf=20,
-                # Sem isto o libx264 HERDA o formato da fonte: episódio 10-bit
-                # gerava clipe High 10 (verificado). H.264 High 10 não é
-                # decodificado por WebCodecs nem pelo NVDEC da maioria das
-                # placas, então esses clipes caem em decode por software no
-                # pipeline de render. Vale SEMPRE, não só nos modos de render —
-                # senão o fallback de CPU produz saída incompatível no meio de
-                # um episódio que começou na GPU.
-                pix_fmt="yuv420p",
-                acodec="aac",
-                format="mp4",
-                movflags="+faststart",
-                loglevel="error",
-                **x264,
-                **common,
-            )
+        # Os parâmetros do encoder vêm de render_output_params (fonte única):
+        # o merge de clipes usa a MESMA função, senão mesclar produziria um
+        # formato diferente do corte e desfaria a garantia do modo.
+        stream = ffmpeg.input(str(video_path), ss=shot.start).output(
+            str(out_file),
+            t=duration,
+            loglevel="error",
+            **render_output_params(render_mode, use_nvenc),
+        )
     else:
         stream = ffmpeg.input(str(video_path), ss=shot.start, to=shot.end).output(
             str(out_file),

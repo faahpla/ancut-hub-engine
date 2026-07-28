@@ -280,6 +280,14 @@ class Database:
             )
             return cur.lastrowid
 
+    def delete_shots(self, shot_ids: list[int]) -> None:
+        """Remove shots e, por ON DELETE CASCADE, as atribuições deles."""
+        if not shot_ids:
+            return
+        marks = ",".join("?" for _ in shot_ids)
+        with self.connect() as c:
+            c.execute(f"DELETE FROM shot WHERE id IN ({marks})", tuple(shot_ids))
+
     def assign_character(self, shot_id: int, character_id: int, confidence: float) -> None:
         with self.connect() as c:
             c.execute(
