@@ -633,6 +633,67 @@ def _merge_shots(episode_id: int, shot_ids: list[int]) -> None:
     })
 
 
+def _delete_shots(episode_id: int, shot_ids: list[int]) -> None:
+    """Apaga cenas de vez: o clipe, os hardlinks e o keyframe.
+
+    Diferente do merge, que só tira de `shots/`. Aqui o usuário está dizendo
+    que a cena não presta, então ela some também de `by_character/` e
+    `by_pair/` — senão continuaria aparecendo nos resultados e nas pastas.
+
+    Como aquelas entradas são hardlinks pro MESMO arquivo, o conteúdo só morre
+    quando o último link cai. Por isso todos são removidos: deixar um pra trás
+    faria o arquivo sobreviver escondido, ocupando espaço sem aparecer.
+    """
+    from .config import Config
+    from .storage.db import Database
+
+    if not shot_ids:
+        _emit({"type": "failed", "message": "nenhuma cena selecionada"})
+        return
+
+    cfg = Config.load()
+    db = Database(cfg.cache_path / "index.db")
+
+    with db.connect() as c:
+        row = c.execute(
+            "SELECT output_root FROM episode WHERE id=?", (episode_id,)
+        ).fetchone()
+    if row is None or not row["output_root"]:
+        _emit({"type": "failed", "message": "pasta do episódio desconhecida"})
+        return
+    episode_root = Path(row["output_root"])
+
+    todos = {r["id"]: r for r in db.shots_for_episode(episode_id)}
+    alvos = [todos[i] for i in shot_ids if i in todos]
+    if not alvos:
+        _emit({"type": "failed", "message": "cenas não encontradas"})
+        return
+
+    arquivos = 0
+    for shot in alvos:
+        nome = Path(shot["file"]).name
+        caminhos = [episode_root / shot["file"]]
+        # Os hardlinks levam o mesmo nome de arquivo em cada pasta.
+        for pasta in ("by_character", "by_pair"):
+            caminhos += list((episode_root / pasta).glob(f"*/{nome}"))
+        if shot["keyframe"]:
+            caminhos.append(episode_root / shot["keyframe"])
+        for p in caminhos:
+            try:
+                p.unlink()
+                arquivos += 1
+            except OSError:
+                pass
+
+    db.delete_shots([s["id"] for s in alvos])
+
+    _emit({
+        "type": "deleted",
+        "deletedCount": len(alvos),
+        "files": arquivos,
+    })
+
+
 def _has_analysis(source: str, anime: str, season: int, episode: int) -> None:
     """Este episódio já tem resultado salvo?
 
@@ -945,6 +1006,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if mode == "merge":
             _merge_shots(int(args[1]), [int(a) for a in args[2:]])
+            return 0
+        if mode == "delete":
+            _delete_shots(int(args[1]), [int(a) for a in args[2:]])
             return 0
         if mode == "run":
             return _run()
