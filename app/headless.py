@@ -324,6 +324,7 @@ def _parse(path: str) -> None:
             "anime": info.anime,
             "season": info.season,
             "episode": info.episode,
+            "kind": info.kind,
             "skipHeadSeconds": head,
             "skipTailSeconds": tail,
         }
@@ -345,16 +346,37 @@ def _backfill_episode_roots(db: Any, output_dir: Path) -> None:
         return
     with db.connect() as c:
         rows = c.execute(
-            "SELECT id, season, episode FROM episode WHERE output_root IS NULL"
+            "SELECT id, season, episode, source_file FROM episode "
+            "WHERE output_root IS NULL"
         ).fetchall()
         for row in rows:
             slug = f"S{int(row['season']):02d}E{int(row['episode']):02d}"
             matches = [p for p in output_dir.glob(f"*/{slug}") if (p / "metadata").is_dir()]
+            if len(matches) > 1 and row["source_file"]:
+                # Dois animes diferentes com o mesmo S03E01 é comum. O
+                # desempate não é chute: cada pasta guarda em shot_bounds.json
+                # o vídeo de onde saiu, e o banco guarda o mesmo caminho.
+                exatas = [p for p in matches if _bounds_source(p) == row["source_file"]]
+                if exatas:
+                    matches = exatas
             if len(matches) == 1:
                 c.execute(
                     "UPDATE episode SET output_root=? WHERE id=?",
                     (str(matches[0]), row["id"]),
                 )
+
+
+def _bounds_source(episode_root: Path) -> str | None:
+    """De qual vídeo esta pasta saiu, segundo o cache de detecção de cenas."""
+    import json as _json
+
+    try:
+        data = _json.loads(
+            (episode_root / "metadata" / "shot_bounds.json").read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return None
+    return data.get("source") if isinstance(data, dict) else None
 
 
 def _recent() -> None:
@@ -380,6 +402,7 @@ def _recent() -> None:
                 "animeTitle": e["anime_title"],
                 "season": e["season"],
                 "episode": e["episode"],
+                "kind": e["kind"],
                 "episodeRoot": str(root),
                 "shotCount": e["shot_count"],
                 "processedAt": e["processed_at"],
@@ -395,10 +418,16 @@ def _results(episode_id: int) -> None:
 
     cfg = Config.load()
     db = Database(cfg.cache_path / "index.db")
+    # Mesmo remendo do histórico: episódio sem pasta gravada não abre, e quem
+    # chega aqui vindo do fim de uma análise não tem como escolher outro.
+    try:
+        _backfill_episode_roots(db, cfg.output_path)
+    except Exception:
+        pass
 
     with db.connect() as c:
         ep = c.execute(
-            "SELECT e.id, e.season, e.episode, e.output_root, e.anime_id, "
+            "SELECT e.id, e.season, e.episode, e.kind, e.output_root, e.anime_id, "
             "       a.title AS anime_title, a.anilist_id, a.mal_id "
             "FROM episode e JOIN anime a ON a.id = e.anime_id WHERE e.id=?",
             (episode_id,),
@@ -424,6 +453,7 @@ def _results(episode_id: int) -> None:
             "animeTitle": ep["anime_title"],
             "season": ep["season"],
             "episode": ep["episode"],
+            "kind": ep["kind"],
             "episodeRoot": ep["output_root"],
             "totalShots": len(db.shots_for_episode(episode_id)),
             "characters": characters,
@@ -783,7 +813,9 @@ def _harvest(episode_id: int) -> None:
     })
 
 
-def _has_analysis(source: str, anime: str, season: int, episode: int) -> None:
+def _has_analysis(
+    source: str, anime: str, season: int, episode: int, kind: str = ""
+) -> None:
     """Este episódio já tem resultado salvo?
 
     A interface usa isso pra perguntar "substituir ou somar" ANTES de rodar —
@@ -796,7 +828,7 @@ def _has_analysis(source: str, anime: str, season: int, episode: int) -> None:
     exists = False
     try:
         db = Database(Config.load().cache_path / "index.db")
-        exists = db.has_analysis(source, anime, season, episode)
+        exists = db.has_analysis(source, anime, season, episode, kind)
     except Exception:
         pass
     _emit({"type": "has-analysis", "exists": exists})
@@ -869,6 +901,7 @@ def _result_payload(result: Any) -> dict[str, Any]:
         "animeTitle": result.anime_title,
         "season": result.season,
         "episode": result.episode,
+        "kind": getattr(result, "kind", ""),
         "episodeId": result.episode_id,
     }
 
@@ -900,6 +933,9 @@ def _run() -> int:
         source=Path(req["videoPath"]),
         skip_head_seconds=float(req.get("skipHeadSeconds", 0)),
         skip_tail_seconds=float(req.get("skipTailSeconds", 0)),
+        # Tipo inventado vira episódio, pela mesma razão do render_export_mode:
+        # um valor desconhecido não pode virar identidade em silêncio.
+        kind=str(req.get("kind", "")).upper() if req.get("kind") in ("OP", "ED") else "",
     )
 
     import time
@@ -1082,7 +1118,10 @@ def main(argv: list[str] | None = None) -> int:
             _skip_ranges(args[1])
             return 0
         if mode == "has-analysis":
-            _has_analysis(args[1], args[2], int(args[3]), int(args[4]))
+            _has_analysis(
+                args[1], args[2], int(args[3]), int(args[4]),
+                args[5] if len(args) > 5 else "",
+            )
             return 0
         if mode == "recent":
             _recent()

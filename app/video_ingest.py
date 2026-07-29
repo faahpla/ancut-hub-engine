@@ -62,9 +62,15 @@ class EpisodeInfo:
     source: Path
     skip_head_seconds: float = 0.0
     skip_tail_seconds: float = 0.0
+    #: "" = episódio, "OP" = abertura, "ED" = encerramento. Faz parte da
+    #: IDENTIDADE: sem isto a abertura da 2ª temporada ocupava a mesma vaga
+    #: que o episódio 1 dela, e uma sobrescrevia a outra.
+    kind: str = ""
 
     @property
     def slug(self) -> str:
+        if self.kind:
+            return f"S{self.season:02d}-{self.kind}{self.episode}"
         return f"S{self.season:02d}E{self.episode:02d}"
 
 
@@ -149,6 +155,27 @@ def _name_from_parents(path: Path, max_up: int = 3) -> str:
     return ""
 
 
+#: Abertura e encerramento no nome do arquivo. `NC` (no credits) é a marca
+#: mais comum nos BDs; "Opening"/"Ending" cobrem o resto. O número é opcional
+#: — anime com uma abertura só costuma vir sem ele.
+_KIND_PATTERNS = [
+    (re.compile(r"\bNC(?:OP|_?OPENING)\s*_?(\d+)?\b", re.I), "OP"),
+    (re.compile(r"\bNC(?:ED|_?ENDING)\s*_?(\d+)?\b", re.I), "ED"),
+    (re.compile(r"\bOP(?:ENING)?\s*_?(\d+)\b", re.I), "OP"),
+    (re.compile(r"\bED|ENDING\s*_?(\d+)\b", re.I), "ED"),
+]
+
+
+def detect_kind(text: str) -> tuple[str, int | None]:
+    """Abertura/encerramento no nome do arquivo. Devolve ("OP"|"ED"|"", nº)."""
+    for pat, kind in _KIND_PATTERNS:
+        m = pat.search(text)
+        if m:
+            num = m.group(1)
+            return kind, int(num) if num else None
+    return "", None
+
+
 def parse_filename(video_path: str | Path) -> EpisodeInfo:
     path = Path(video_path)
     stem = path.stem
@@ -156,6 +183,7 @@ def parse_filename(video_path: str | Path) -> EpisodeInfo:
 
     season = 1
     episode = 1
+    kind, kind_num = detect_kind(stem)
 
     # Try combined Season+Episode patterns first (strongest signal)
     combined_hit = False
@@ -201,4 +229,12 @@ def parse_filename(video_path: str | Path) -> EpisodeInfo:
     if not name:
         name = cleaned.split(" - ")[0].strip() or stem
 
-    return EpisodeInfo(anime=name, season=season, episode=episode, source=path)
+    if kind:
+        # "Tensura S2 NCOP1": o `1` do NCOP é o número DA ABERTURA, e os
+        # padrões de episódio acima já o leram como episódio 1. Aqui ele volta
+        # pro lugar certo; sem número no nome, assume a primeira.
+        episode = kind_num if kind_num is not None else 1
+
+    return EpisodeInfo(
+        anime=name, season=season, episode=episode, source=path, kind=kind
+    )

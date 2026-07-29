@@ -28,7 +28,11 @@ CREATE TABLE IF NOT EXISTS episode (
     -- que não fica em lugar nenhum — era o que impedia reabrir um resultado
     -- antigo sem reanalisar.
     output_root TEXT,
-    UNIQUE(anime_id, season, episode)
+    -- '' = episódio, 'OP' = abertura, 'ED' = encerramento. Entra na chave
+    -- porque a abertura da 2ª temporada NÃO é o episódio 1 dela: sem esta
+    -- coluna as duas dividiam a mesma linha e uma apagava os shots da outra.
+    kind TEXT NOT NULL DEFAULT '',
+    UNIQUE(anime_id, season, episode, kind)
 );
 
 CREATE TABLE IF NOT EXISTS character (
@@ -104,6 +108,82 @@ class Database:
         cols = {r["name"] for r in c.execute("PRAGMA table_info(episode)")}
         if "output_root" not in cols:
             c.execute("ALTER TABLE episode ADD COLUMN output_root TEXT")
+        if "kind" not in cols:
+            Database._backup_before_rebuild(c)
+            Database._migrate_episode_kind(c)
+
+    @staticmethod
+    def _backup_before_rebuild(c: sqlite3.Connection) -> None:
+        """Cópia do banco antes de reconstruir uma tabela.
+
+        Migração aditiva (ALTER TABLE ADD COLUMN) não precisa disso; derrubar
+        e recriar tabela, sim. O acervo do usuário são horas de análise, e um
+        arquivo de 2 MB é barato demais pra não fazer.
+        """
+        import shutil
+
+        origem = Path(
+            c.execute("PRAGMA database_list").fetchone()[2] or ""
+        )
+        if not origem.is_file():
+            return
+        destino = origem.with_suffix(origem.suffix + ".antes-de-kind.bak")
+        if destino.exists():
+            return  # já existe de uma tentativa anterior: não sobrescrever
+        try:
+            shutil.copy2(origem, destino)
+        except OSError:
+            pass  # sem espaço/permissão: a migração é transacional de todo jeito
+
+    @staticmethod
+    def _migrate_episode_kind(c: sqlite3.Connection) -> None:
+        """Acrescenta `kind` e troca a chave única de (anime, temporada,
+        episódio) para (…, kind).
+
+        Aqui não dá pra usar ALTER TABLE: o SQLite adiciona coluna, mas não
+        remove um UNIQUE de tabela. Com o antigo no lugar, gravar a abertura
+        da temporada 2 esbarraria no episódio 1 dela. Então é a reconstrução
+        documentada pelo SQLite — tabela nova, cópia, troca de nome.
+
+        Os ids são PRESERVADOS na cópia, então `shot` e `manual_override`
+        continuam apontando pras mesmas linhas. É por isso que as chaves
+        estrangeiras ficam desligadas durante a troca: por um instante a
+        tabela `episode` não existe, e com elas ligadas o SQLite apagaria os
+        shots em cascata.
+        """
+        c.execute("PRAGMA foreign_keys = OFF")
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            c.execute(
+                """
+                CREATE TABLE episode_novo (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    anime_id INTEGER NOT NULL REFERENCES anime(id) ON DELETE CASCADE,
+                    season INTEGER NOT NULL,
+                    episode INTEGER NOT NULL,
+                    source_file TEXT,
+                    processed_at TIMESTAMP,
+                    output_root TEXT,
+                    kind TEXT NOT NULL DEFAULT '',
+                    UNIQUE(anime_id, season, episode, kind)
+                )
+                """
+            )
+            c.execute(
+                "INSERT INTO episode_novo "
+                "(id, anime_id, season, episode, source_file, processed_at, "
+                " output_root, kind) "
+                "SELECT id, anime_id, season, episode, source_file, "
+                "       processed_at, output_root, '' FROM episode"
+            )
+            c.execute("DROP TABLE episode")
+            c.execute("ALTER TABLE episode_novo RENAME TO episode")
+            c.execute("COMMIT")
+        except Exception:
+            c.execute("ROLLBACK")
+            raise
+        finally:
+            c.execute("PRAGMA foreign_keys = ON")
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -143,11 +223,19 @@ class Database:
             )
             return cur.lastrowid
 
-    def upsert_episode(self, anime_id: int, season: int, episode: int, source: str) -> int:
+    def upsert_episode(
+        self,
+        anime_id: int,
+        season: int,
+        episode: int,
+        source: str,
+        kind: str = "",
+    ) -> int:
         with self.connect() as c:
             row = c.execute(
-                "SELECT id FROM episode WHERE anime_id=? AND season=? AND episode=?",
-                (anime_id, season, episode),
+                "SELECT id FROM episode "
+                "WHERE anime_id=? AND season=? AND episode=? AND kind=?",
+                (anime_id, season, episode, kind),
             ).fetchone()
             if row:
                 c.execute(
@@ -156,9 +244,9 @@ class Database:
                 )
                 return row["id"]
             cur = c.execute(
-                "INSERT INTO episode(anime_id, season, episode, source_file, processed_at) "
-                "VALUES(?,?,?,?,CURRENT_TIMESTAMP)",
-                (anime_id, season, episode, source),
+                "INSERT INTO episode(anime_id, season, episode, source_file, "
+                "processed_at, kind) VALUES(?,?,?,?,CURRENT_TIMESTAMP,?)",
+                (anime_id, season, episode, source, kind),
             )
             return cur.lastrowid
 
@@ -178,7 +266,7 @@ class Database:
         """
         with self.connect() as c:
             rows = c.execute(
-                "SELECT e.id, e.season, e.episode, e.output_root, e.processed_at, "
+                "SELECT e.id, e.season, e.episode, e.kind, e.output_root, e.processed_at, "
                 "       a.title AS anime_title, "
                 "       (SELECT COUNT(*) FROM shot s WHERE s.episode_id = e.id) AS shot_count "
                 "FROM episode e JOIN anime a ON a.id = e.anime_id "
@@ -367,22 +455,27 @@ class Database:
     # --- reanálise: substituir vs adicionar ---
 
     def has_analysis(
-        self, source: str, anime_title: str, season: int, episode: int
+        self, source: str, anime_title: str, season: int, episode: int,
+        kind: str = "",
     ) -> bool:
         """True se este episódio já tem atribuições salvas (pra UI perguntar
         'substituir ou adicionar?'). Casa por arquivo fonte OU por
-        título+temporada+episódio."""
+        título+temporada+episódio.
+
+        `kind` entra na comparação junto: a abertura da 2ª temporada não é o
+        episódio 1 dela, e sem isto analisar a abertura perguntava
+        'substituir ou somar?' apontando pro episódio errado."""
         with self.connect() as c:
             row = c.execute(
                 """SELECT 1 FROM shot_character sc
                    JOIN shot s ON s.id = sc.shot_id
                    JOIN episode e ON e.id = s.episode_id
                    LEFT JOIN anime a ON a.id = e.anime_id
-                   WHERE e.source_file = ?
+                   WHERE (e.source_file = ? AND e.kind = ?)
                       OR (a.title = ? COLLATE NOCASE
-                          AND e.season = ? AND e.episode = ?)
+                          AND e.season = ? AND e.episode = ? AND e.kind = ?)
                    LIMIT 1""",
-                (source, anime_title, season, episode),
+                (source, kind, anime_title, season, episode, kind),
             ).fetchone()
             return row is not None
 

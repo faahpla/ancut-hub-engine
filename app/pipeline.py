@@ -144,7 +144,9 @@ class Pipeline:
             title=bundle.title,
             title_english=bundle.title_english,
         )
-        episode_id = self.db.upsert_episode(anime_id, info.season, info.episode, str(info.source))
+        episode_id = self.db.upsert_episode(
+            anime_id, info.season, info.episode, str(info.source), info.kind
+        )
         # Guarda a pasta de saída real: é o que permite reabrir este resultado
         # depois sem reanalisar (reconstruir o caminho dependia do nome que o
         # usuário digitou, que não fica salvo em lugar nenhum).
@@ -1188,6 +1190,7 @@ class Pipeline:
             season=info.season,
             episode=info.episode,
             episode_id=episode_id,
+            kind=info.kind,
             low_refs_warning=low_refs_warning,
             refs_dir=refs_dir,
         )
@@ -1300,8 +1303,14 @@ class Pipeline:
         cb("embed_refs", 1.0, "Modelos prontos")
 
         episode_id = self.db.upsert_episode(
-            anime_id, info.season, info.episode, str(info.source)
+            anime_id, info.season, info.episode, str(info.source), info.kind
         )
+        # Gravar a pasta AQUI, e não só no commit: sem isto uma descoberta
+        # abandonada (ou que ainda não foi batizada) deixava output_root NULL,
+        # e episódio sem pasta some do histórico e não abre — a aba de
+        # resultados caía na análise anterior como se a nova nunca tivesse
+        # existido.
+        self.db.set_episode_root(episode_id, str(episode_root))
         self.db.clear_episode_shots(episode_id)
 
         observations: list[FaceObservation] = []
