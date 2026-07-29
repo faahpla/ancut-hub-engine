@@ -54,13 +54,28 @@ _CHANNEL = sys.stdout if sys.stdout is not None else _fd_stream(1)
 # Todo print() do pipeline vira log (stderr), nunca evento.
 sys.stdout = sys.stderr if sys.stderr is not None else _fd_stream(2)
 
+# Os eventos já vão em ASCII puro (ver _emit), mas os LOGS não passam pelo
+# json — um print com acento sairia em cp1252 no log do host. Aqui não dá
+# pra confiar em PYTHONIOENCODING: o executável do PyInstaller nem sempre
+# lê essa variável.
+for _stream in (_CHANNEL, sys.stdout):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError, ValueError):
+        pass
+
 _write_lock = threading.Lock()
 
 
 def _emit(payload: dict[str, Any]) -> None:
     """Escreve um evento no canal. Thread-safe e sempre com flush — o host
     lê linha a linha e um buffer preso faria a barra de progresso travar."""
-    line = json.dumps(payload, ensure_ascii=False, default=str)
+    # ensure_ascii=True (o padrão) NÃO é preguiça: com ele o acento vai como
+    # á e o canal inteiro vira ASCII puro, imune à codificação com que o
+    # Python abriu a saída. Com ensure_ascii=False, "análise" saía em cp1252
+    # (`61 6E E1`) enquanto o host lia UTF-8, e todo acento chegava na tela
+    # como losango. O JSON.parse do outro lado devolve o "á" intacto.
+    line = json.dumps(payload, default=str)
     with _write_lock:
         _CHANNEL.write(line + "\n")
         _CHANNEL.flush()
