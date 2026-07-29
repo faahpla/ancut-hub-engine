@@ -694,6 +694,80 @@ def _delete_shots(episode_id: int, shot_ids: list[int]) -> None:
     })
 
 
+def _harvest(episode_id: int) -> None:
+    """Reforça as refs do anime com os rostos deste episódio.
+
+    Colhe recortes de alta confiança das cenas já identificadas e guarda como
+    referência do personagem. Vale mais que arte promocional porque casa com o
+    traço e a luz do próprio anime — cada episódio conferido deixa a próxima
+    análise mais fiel.
+
+    Emite progresso porque carrega CLIP e YOLO (~5s) e depois varre as cenas:
+    sem isso a interface ficaria parada sem explicação.
+    """
+    from .config import Config
+    from .storage.db import Database
+
+    cfg = Config.load()
+    db = Database(cfg.cache_path / "index.db")
+
+    with db.connect() as c:
+        ep = c.execute(
+            "SELECT e.output_root, a.anilist_id, a.mal_id "
+            "FROM episode e JOIN anime a ON a.id = e.anime_id WHERE e.id=?",
+            (episode_id,),
+        ).fetchone()
+    if ep is None or not ep["output_root"]:
+        _emit({"type": "failed", "message": "pasta do episódio desconhecida"})
+        return
+
+    cache_id = _franchise_cache_id(cfg, ep["anilist_id"], ep["mal_id"])
+    if not cache_id:
+        _emit({
+            "type": "failed",
+            "message": "este anime não tem banco de referências pra reforçar",
+        })
+        return
+
+    _emit({"type": "harvest-progress", "name": "carregando os modelos",
+           "done": 0, "total": 0})
+
+    from .harvest import harvest_all_characters
+    from .matching.embedding_engine import EmbeddingEngine
+    from .matching.face_detector import AnimeFaceDetector
+    from .references.reference_store import ReferenceStore
+
+    face_det = AnimeFaceDetector()
+    engine = EmbeddingEngine(
+        model_name=cfg.clip_model,
+        pretrained=cfg.clip_pretrained,
+        use_cuda=cfg.use_cuda,
+    )
+    store = ReferenceStore(cfg.cache_path)
+
+    adicionadas = harvest_all_characters(
+        Path(ep["output_root"]),
+        episode_id,
+        cache_id,
+        db,
+        store,
+        face_det,
+        engine,
+        on_progress=lambda nome, feito, total: _emit({
+            "type": "harvest-progress", "name": nome,
+            "done": feito, "total": total,
+        }),
+    )
+
+    _emit({
+        "type": "harvest-done",
+        "added": adicionadas,
+        "total": sum(adicionadas.values()),
+        "characters": len(adicionadas),
+        "refsDir": _refs_dir_for(cfg, ep["anilist_id"], ep["mal_id"]),
+    })
+
+
 def _has_analysis(source: str, anime: str, season: int, episode: int) -> None:
     """Este episódio já tem resultado salvo?
 
@@ -1009,6 +1083,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if mode == "delete":
             _delete_shots(int(args[1]), [int(a) for a in args[2:]])
+            return 0
+        if mode == "harvest":
+            _harvest(int(args[1]))
             return 0
         if mode == "run":
             return _run()
