@@ -44,6 +44,17 @@ class JikanClient:
         # antes/depois pra saber se o MyAnimeList estava fora do ar (e avisar
         # o usuário em vez de entregar um "0 personagens" mudo).
         self.failures = 0
+        #: Falhas em SEQUÊNCIA. Zera a cada resposta boa.
+        self.streak = 0
+        #: Disjuntor: quando a fonte cai de vez, parar de bater nela.
+        #:
+        #: Medido em 2026-07-29 com o MyAnimeList devolvendo 504: 19
+        #: personagens seguidos falharam, cada um com 3 tentativas e espera
+        #: crescente — 114 dos 138 segundos da etapa foram gastos insistindo
+        #: em quem não ia responder. Cinco em sequência já é resposta
+        #: suficiente sobre o estado da fonte.
+        self.give_up_after = 5
+        self.gave_up = False
 
     def close(self) -> None:
         self.client.close()
@@ -54,7 +65,21 @@ class JikanClient:
             time.sleep(self.min_interval - delta)
         self._last = time.monotonic()
 
-    def _get(self, path: str) -> dict | None:
+    def _get(self, path: str, essencial: bool = False) -> dict | None:
+        """`essencial`: ignora o disjuntor e tenta de qualquer jeito.
+
+        A diferença importa. Desistir de uma galeria de fotos degrada o
+        resultado; desistir da BUSCA do anime aborta a análise com "anime não
+        encontrado", que é mentira quando o que houve foi instabilidade. Só o
+        que dá pra perder sem quebrar nada respeita o disjuntor.
+        """
+        if self.gave_up and not essencial:
+            # Nem tenta: sem rede, sem espera, sem retry. Quem chama trata o
+            # None como "sem galeria", que é o mesmo caminho de um personagem
+            # sem fotos — e os retratos oficiais continuam entrando.
+            self.failures += 1
+            return None
+
         last_status: int | str = "?"
         for attempt in range(3):
             self._throttle()
@@ -65,6 +90,7 @@ class JikanClient:
                 time.sleep(1.0 + attempt)
                 continue
             if r.status_code == 200:
+                self.streak = 0
                 return r.json()
             last_status = r.status_code
             # Jikan runs on shared infra and throws transient 429/5xx under
@@ -76,6 +102,14 @@ class JikanClient:
             break
         print(f"[Jikan] {path} falhou apos retries (HTTP {last_status})", flush=True)
         self.failures += 1
+        self.streak += 1
+        if self.streak >= self.give_up_after and not self.gave_up:
+            self.gave_up = True
+            print(
+                f"[Jikan] {self.streak} falhas seguidas — desistindo do "
+                "MyAnimeList nesta rodada.",
+                flush=True,
+            )
         return None
 
     def search_anime(self, name: str) -> JikanAnime | None:
@@ -86,7 +120,7 @@ class JikanClient:
         # We URL-encode `name` manually since httpx is passing it via path.
         from urllib.parse import quote
         path = f"/anime?q={quote(name)}&limit=5&sfw=true&order_by=popularity&sort=asc"
-        data = self._get(path)
+        data = self._get(path, essencial=True)
         if not data:
             return None
         for entry in data.get("data") or []:

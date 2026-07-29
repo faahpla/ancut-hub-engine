@@ -86,6 +86,36 @@ class AnimeBundle:
     # Banco criado pelo Modo Descoberta (sem ids online): força a pasta de
     # cache/refs pra "local-<slug>" em vez de al<id>/mal<id>.
     cache_id_override: str | None = None
+    #: Montado com a fonte caindo: falta galeria de alguém. É guardado assim
+    #: MESMO — jogar fora custava 140s em toda análise seguinte — mas fica
+    #: marcado, e a próxima rodada tenta só o que falta.
+    partial: bool = False
+    #: MAL ids que ficaram sem galeria. Vazio num banco completo.
+    missing_gallery: list[int] | None = None
+    #: Quando foi montado (ISO). Serve pra saber a idade de um banco parcial.
+    fetched_at: str | None = None
+
+
+def _mais_velho_que(quando_iso: str | None, horas: float) -> bool:
+    """O carimbo é mais antigo que N horas? Sem carimbo = sim (banco velho,
+    de antes deste campo existir — vale tentar)."""
+    from datetime import datetime, timedelta, timezone
+
+    if not quando_iso:
+        return True
+    try:
+        quando = datetime.fromisoformat(quando_iso)
+    except ValueError:
+        return True
+    if quando.tzinfo is None:
+        quando = quando.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - quando > timedelta(hours=horas)
+
+
+def _agora() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def local_cache_id(anime_name: str) -> str:
@@ -197,6 +227,9 @@ class AnimeProvider:
                 characters=chars,
                 franchise_ids=data.get("franchise_ids"),
                 franchise_root_id=data.get("franchise_root_id"),
+                partial=bool(data.get("partial", False)),
+                missing_gallery=data.get("missing_gallery") or [],
+                fetched_at=data.get("fetched_at"),
             )
         except Exception:
             return None
@@ -218,9 +251,115 @@ class AnimeProvider:
             "title_english": bundle.title_english,
             "franchise_ids": bundle.franchise_ids,
             "franchise_root_id": bundle.franchise_root_id,
+            "partial": bundle.partial,
+            "missing_gallery": bundle.missing_gallery or [],
+            "fetched_at": bundle.fetched_at or _agora(),
             "characters": [asdict(c) for c in bundle.characters],
         }
         p.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    # ------------------------------------------------------------------
+    # Atalho nome -> cache_id
+    #
+    # O cache do elenco é chaveado pelo id da FRANQUIA, que só se descobre
+    # depois de consultar a AniList. Isso tinha duas consequências ruins:
+    # toda análise pagava a busca online mesmo com o banco pronto no disco, e
+    # com a AniList fora do ar o app não achava nem o próprio cache — dizia
+    # "anime não encontrado" tendo 80 personagens guardados aqui do lado.
+    #
+    # Este índice guarda o que a busca já respondeu uma vez. É só um atalho:
+    # se apontar pra um banco que não existe mais, o caminho normal roda.
+    # ------------------------------------------------------------------
+    def _atalho_path(self) -> Path:
+        return self.cache_root / "busca_resolvida.json"
+
+    @staticmethod
+    def _atalho_chave(anime_name: str, season: int) -> str:
+        return f"{re.sub(r'[^a-z0-9]+', ' ', anime_name.lower()).strip()}|s{season}"
+
+    def _atalho_ler(self, anime_name: str, season: int) -> str | None:
+        try:
+            dados = json.loads(self._atalho_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        valor = dados.get(self._atalho_chave(anime_name, season))
+        return valor if isinstance(valor, str) else None
+
+    def _atalho_gravar(self, anime_name: str, season: int, cache_id: str) -> None:
+        caminho = self._atalho_path()
+        try:
+            dados = json.loads(caminho.read_text(encoding="utf-8"))
+            if not isinstance(dados, dict):
+                dados = {}
+        except (OSError, ValueError):
+            dados = {}
+        dados[self._atalho_chave(anime_name, season)] = cache_id
+        try:
+            caminho.write_text(
+                json.dumps(dados, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+        except OSError:
+            pass  # atalho é conveniência: falhar aqui não pode parar a análise
+
+    def _completar_galerias(
+        self,
+        cache_id: str,
+        bundle: AnimeBundle,
+        status: Callable[[str], None],
+    ) -> AnimeBundle:
+        """Tenta buscar SÓ as galerias que faltaram numa rodada anterior.
+
+        É o que torna o cache parcial honesto: em vez de congelar um banco
+        capenga, cada análise seguinte cobra o troco da fonte — mas pagando
+        por 3 personagens, não pelos 80. Se o MyAnimeList continuar fora, o
+        disjuntor corta na quinta falha e a rodada custa segundos.
+        """
+        faltando = list(bundle.missing_gallery or [])
+        if not faltando:
+            return bundle
+
+        # Trégua. Sem ela, com a fonte fora do ar o dia inteiro, TODA análise
+        # gastava ~30s tentando os mesmos personagens até o disjuntor cortar.
+        # Uma tentativa a cada 6h é o suficiente pra se curar sozinho sem
+        # cobrar pedágio de quem está analisando uma temporada em sequência.
+        if not _mais_velho_que(bundle.fetched_at, horas=6):
+            status(
+                f"{len(faltando)} galerias ainda faltam, mas a fonte foi "
+                "testada há pouco — tentando de novo mais tarde."
+            )
+            return bundle
+
+        status(f"Completando {len(faltando)} galerias que faltaram antes...")
+        por_mal = {c.mal_id: c for c in bundle.characters if c.mal_id is not None}
+        ainda_faltam: list[int] = []
+        recuperados = 0
+        for mal_id in faltando:
+            ch = por_mal.get(mal_id)
+            if ch is None:
+                continue  # sumiu do elenco: não é mais dívida
+            antes = self.jikan.failures
+            pics = self.jikan.character_pictures(mal_id)
+            if self.jikan.failures > antes:
+                ainda_faltam.append(mal_id)
+                continue
+            novas = [u for u in pics if u not in ch.image_urls]
+            if novas:
+                # Galeria na FRENTE dos retratos oficiais: é a ordem que o
+                # resto do pipeline já espera.
+                ch.image_urls[:0] = novas
+                recuperados += 1
+
+        bundle.missing_gallery = ainda_faltam
+        bundle.partial = bool(ainda_faltam)
+        # Renova o carimbo mesmo quando não recuperou nada: é ele que marca
+        # o início da trégua. Sem isso a próxima análise tentaria na hora.
+        bundle.fetched_at = _agora()
+        self.save_cache(cache_id, bundle)
+        status(
+            f"Completado: +{recuperados} galerias"
+            + (f", {len(ainda_faltam)} ainda faltando." if ainda_faltam else ", banco completo.")
+        )
+        return bundle
 
     def resolve(
         self,
@@ -238,6 +377,18 @@ class AnimeProvider:
         def status(msg: str) -> None:
             if on_status:
                 on_status(msg)
+
+        # Atalho: este nome + temporada já foi resolvido antes? Então o banco
+        # está no disco e não há por que consultar ninguém.
+        atalho = self._atalho_ler(anime_name, season)
+        if atalho:
+            guardado = self.load_cached(atalho)
+            if guardado is not None and guardado.characters:
+                status(
+                    f"Banco já conhecido deste anime "
+                    f"({len(guardado.characters)} personagens)."
+                )
+                return self._completar_galerias(atalho, guardado, status)
 
         # For season > 1 we have to disambiguate on AniList, because the
         # plain search picks the most popular entry (usually S1). AniList
@@ -330,7 +481,8 @@ class AnimeProvider:
         cached = self.load_cached(cache_id)
         if cached is not None and cached.characters:
             status(f"Reusando banco cacheado ({len(cached.characters)} personagens).")
-            return cached
+            self._atalho_gravar(anime_name, season, cache_id)
+            return self._completar_galerias(cache_id, cached, status)
 
         if mal_id is None:
             raise RuntimeError(
@@ -364,7 +516,8 @@ class AnimeProvider:
         cached = self.load_cached(cache_id)
         if cached is not None and cached.characters:
             status(f"Reusando banco cacheado ({len(cached.characters)} personagens).")
-            return cached
+            self._atalho_gravar(anime_name, season, cache_id)
+            return self._completar_galerias(cache_id, cached, status)
 
         status(f"Baixando personagens de {len(franchise_mal_ids)} temporada(s)...")
         self.source_warnings = []
@@ -500,6 +653,7 @@ class AnimeProvider:
             )
 
         resolved: list[CharacterRef] = []
+        sem_galeria: list[int] = []
         for i, ch in enumerate(sorted_chars, 1):
             status(f"Coletando imagens ({i}/{len(sorted_chars)}): {ch['name']}")
 
@@ -509,7 +663,12 @@ class AnimeProvider:
             # reserva AniList — sem galeria do MAL pra buscar.)
             jikan_urls: list[str] = []
             if ch["mal_id"] is not None and i <= gallery_limit:
+                antes = self.jikan.failures
                 pics = self.jikan.character_pictures(ch["mal_id"])
+                if self.jikan.failures > antes:
+                    # Falhou (não é "esse personagem não tem foto"): anota pra
+                    # próxima rodada tentar SÓ estes, em vez de tudo de novo.
+                    sem_galeria.append(ch["mal_id"])
                 for u in pics:
                     if u not in jikan_urls:
                         jikan_urls.append(u)
@@ -571,14 +730,22 @@ class AnimeProvider:
             franchise_ids=franchise_anilist_ids,
             franchise_root_id=root_id,
         )
-        # Banco montado com fonte fora do ar é DEGRADADO — cachear ele
-        # congelaria o estrago (o "reusando banco cacheado" pularia o MAL
-        # pra sempre). Sem cache, a próxima análise tenta completo de novo.
-        if self.jikan.failures == fails_start:
-            self.save_cache(cache_id, bundle)
-        else:
+        # Banco montado com a fonte fora do ar é DEGRADADO. Antes ele era
+        # simplesmente DESCARTADO, pra não congelar o estrago — mas isso
+        # cobrava a busca inteira (140s medidos) em TODA análise seguinte
+        # enquanto o MyAnimeList estivesse instável, que é justamente quando
+        # ele mais cai. Agora é guardado marcado como parcial, com a lista de
+        # quem ficou sem galeria: a próxima rodada reusa o que já tem e tenta
+        # SÓ o que falta.
+        bundle.partial = bool(sem_galeria) or self.jikan.failures != fails_start
+        bundle.missing_gallery = sem_galeria
+        bundle.fetched_at = _agora()
+        self.save_cache(cache_id, bundle)
+        self._atalho_gravar(anime_name, season, cache_id)
+        if bundle.partial:
             status(
-                "Banco NÃO salvo no cache (fonte instável) — a próxima "
-                "análise busca tudo de novo."
+                f"Banco salvo PARCIAL: {len(sem_galeria)} personagens sem "
+                "galeria (fonte instável). A próxima análise reusa o resto e "
+                "tenta só esses."
             )
         return bundle
