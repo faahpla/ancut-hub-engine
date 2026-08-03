@@ -694,6 +694,23 @@ class Pipeline:
         if cfg.skip_credit_shots:
             print(f"[CorteCenas] Shots ignorados por créditos/texto: {credit_shots}/{total}")
 
+        # === Veto do CCIP nas decisões apertadas ===
+        # Vem ANTES da segunda passada de propósito: as cenas identificadas
+        # viram referência do próprio episódio ali, e deixar um erro apertado
+        # entrar nesse banco espalharia o erro pelo episódio inteiro.
+        juiz_ccip = None
+        if cfg.ccip_veto and entries and not use_ai_recognition:
+            juiz_ccip = self._veto_ccip(
+                cb=cb,
+                entries=entries,
+                shot_faces=shot_faces,
+                per_shot_names=per_shot_names,
+                shot_db_ids=shot_db_ids,
+                kf_cache=kf_cache,
+                ref_cache=ref_cache,
+                refs_per_char=refs_per_char,
+            )
+
         # === Segunda passada: resgate por semelhança no próprio episódio ===
         # As cenas identificadas viram refs temporárias (mesmo traço/ângulo);
         # as sem dono são recomparadas contra elas. Pega o clássico "mesma
@@ -735,6 +752,31 @@ class Pipeline:
                 f"[2a passada] Banco de {len(banks)} personagens; "
                 f"{len(rescues)} cenas resgatadas."
             )
+            # O CCIP confere TODO resgate, não só os apertados. A segunda
+            # passada compara cena com cena do mesmo episódio — mesmo traço,
+            # mesma luz, então a similaridade sobe pra 0,9 mesmo entre
+            # personagens diferentes e o número deixa de separar. É
+            # exatamente o lugar onde uma opinião de fora vale mais, e onde
+            # um erro se multiplica: a cena resgatada errada vira fonte do
+            # resgate seguinte.
+            if cfg.ccip_veto and rescues:
+                self._veto_ccip(
+                    cb=cb,
+                    entries=entries,
+                    shot_faces=shot_faces,
+                    per_shot_names=per_shot_names,
+                    shot_db_ids=shot_db_ids,
+                    kf_cache=kf_cache,
+                    ref_cache=ref_cache,
+                    refs_per_char=refs_per_char,
+                    candidatos=[
+                        (pos, cid, sim)
+                        for pos, hits in rescues.items()
+                        for cid, sim in hits
+                    ],
+                    juiz=juiz_ccip,
+                    etiqueta="2a passada",
+                )
             cb(
                 "second_pass",
                 1.0,
@@ -1123,6 +1165,153 @@ class Pipeline:
         if not benchmark:
             self._report_timings(timer, metadata_dir)
         return result
+
+    def _veto_ccip(
+        self,
+        *,
+        cb: ProgressCb,
+        entries: list[CharacterEntry],
+        shot_faces: list,
+        per_shot_names: list[list[str]],
+        shot_db_ids: list[int],
+        kf_cache: FeatureCache,
+        ref_cache: FeatureCache,
+        refs_per_char: dict,
+        candidatos: list[tuple[int, int, float]] | None = None,
+        juiz=None,
+        etiqueta: str = "CLIP",
+    ):
+        """Segunda opinião nas decisões que o CLIP tomou raspando.
+
+        Só as apertadas entram: confiança abaixo de `threshold +
+        ccip_veto_band`. As confortáveis não são nem consultadas — gastar CPU
+        pra confirmar o óbvio atrasaria a análise sem mudar nada.
+
+        Um veto derruba a atribuição no banco e na lista em memória. Se a
+        cena ficar sem ninguém, ela some do resultado — que é o certo: era
+        uma identificação em que nem o CLIP estava convencido e o modelo
+        treinado pra esta pergunta discordou.
+
+        `candidatos` permite reusar isto pra outra fonte de decisão (os
+        resgates da segunda passada), e `juiz` carrega o modelo e os rostos
+        de referência de uma chamada pra outra — subir o CCIP custa ~8s, e
+        pagar isso duas vezes por episódio seria desperdício puro.
+
+        Devolve o juiz, pra próxima chamada aproveitar.
+        """
+        from .matching.ccip import CcipEngine, CcipJuiz
+
+        cfg = self.cfg
+        por_id = {e.id: e for e in entries}
+
+        # 1) Quem é candidato a veto? Se ninguém, nem carrega o modelo.
+        apertadas = candidatos
+        if apertadas is None:
+            apertadas = []
+            for sf in shot_faces:
+                if sf.embs is None or not sf.assigned or not sf.face_refs:
+                    continue
+                for cid, conf in sf.assigned:
+                    e = por_id.get(cid)
+                    if e is not None and conf < e.threshold + cfg.ccip_veto_band:
+                        apertadas.append((sf.pos, cid, conf))
+        if not apertadas:
+            return juiz
+
+        cb("second_pass", -1.0,
+           f"Conferindo {len(apertadas)} decisões ({etiqueta})...")
+        if juiz is None:
+            # ~150 MB na primeira vez. Avisar antes é o mínimo: sem isto a
+            # barra fica parada num "conferindo" que na verdade é download.
+            cb("second_pass", -1.0,
+               "Carregando a segunda opinião (só baixa na primeira vez)...")
+            engine = CcipEngine()
+            if not engine.disponivel:
+                return None
+            juiz = CcipJuiz(engine)
+        engine = juiz.engine
+
+        # 2) Rostos de REFERÊNCIA dos personagens envolvidos, recortados a
+        #    partir dos boxes que o cache de refs já guarda.
+        alvos = {cid for _, cid, _ in apertadas}
+        for e in entries:
+            if e.id not in alvos:
+                continue
+            rostos: list[np.ndarray] = []
+            for p in refs_per_char.get(e.name, []):
+                if len(rostos) >= cfg.ccip_max_refs:
+                    break
+                boxes = ref_cache.get(p, "boxes")
+                if boxes is None or not len(boxes):
+                    continue
+                img = cv2.imread(str(p))
+                if img is None:
+                    continue
+                crops, _ = crops_from_boxes(img, boxes, cfg.face_crop_padding)
+                rostos.extend(crops[: cfg.ccip_max_refs - len(rostos)])
+            juiz.registrar(e.id, rostos)
+
+        # 3) Julga. Os rostos da cena são rematerializados dos mesmos boxes.
+        por_pos = {sf.pos: sf for sf in shot_faces}
+        derrubadas = 0
+        for pos, cid, conf in apertadas:
+            sf = por_pos.get(pos)
+            if sf is None or not juiz.conhece(cid):
+                continue
+            rostos = self._crops_de(kf_cache, sf.face_refs, cfg.face_crop_padding,
+                                    cfg.ccip_max_faces)
+            if not rostos:
+                continue
+            ok, dif = juiz.aprova(engine.embed(rostos), cid)
+            if ok:
+                continue
+            nome = por_id[cid].name
+            self.db.remove_shot_character(shot_db_ids[pos], cid)
+            per_shot_names[pos] = [n for n in per_shot_names[pos] if n != nome]
+            sf.assigned = [(c, s) for c, s in sf.assigned if c != cid]
+            derrubadas += 1
+            print(f"[CCIP] veto ({etiqueta}): cena #{pos:04d} nao e {nome} "
+                  f"(conf {conf:.2f}, diferenca {dif:.3f})", flush=True)
+        print(
+            f"[CCIP] {etiqueta}: {len(apertadas)} conferidas, "
+            f"{derrubadas} derrubadas.",
+            flush=True,
+        )
+        cb("second_pass", -1.0,
+           f"CCIP derrubou {derrubadas} identificações duvidosas ({etiqueta})")
+        return juiz
+
+    @staticmethod
+    def _crops_de(
+        kf_cache: FeatureCache, face_refs: list, pad: float, maximo: int
+    ) -> list[np.ndarray]:
+        """Rostos de um shot como imagens, a partir da proveniência guardada.
+
+        Igual ao `_materialize_crops`, mas devolvendo arrays em vez de JPEG:
+        aqui a imagem vai direto pro modelo, e passar por codificação e
+        decodificação de JPEG no meio só perderia qualidade e tempo.
+        """
+        saida: list[np.ndarray] = []
+        memo: dict[str, list] = {}
+        for fr in face_refs or []:
+            if len(saida) >= maximo:
+                break
+            if not fr:
+                continue
+            kf_path, bi = fr
+            key = str(kf_path)
+            if key not in memo:
+                boxes = kf_cache.get(Path(kf_path), "boxes")
+                crops: list = []
+                if boxes is not None and len(boxes):
+                    img = cv2.imread(key)
+                    if img is not None:
+                        crops = crops_from_boxes(img, boxes, pad)[0]
+                memo[key] = crops
+            crops = memo[key]
+            if bi < len(crops):
+                saida.append(crops[bi])
+        return saida
 
     def _finalize_episode(
         self,

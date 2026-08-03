@@ -207,6 +207,23 @@ class Config:
     # A âncora é o ponto: exigir só "mais cenas" não resolve, porque refs
     # ruins erram MUITAS cenas com a mesma confiança medíocre. Uma única
     # certeza vale mais que dez talvez.
+    # --- CCIP: a segunda opinião ---
+    #
+    # O CLIP decide raspando: a margem média entre 1º e 2º colocado é 0,077.
+    # O CCIP (deepghs) foi treinado exatamente pra "estes dois desenhos são a
+    # mesma pessoa?" e publica a própria régua: F1 0,917 com corte em 0,1784
+    # de DIFERENÇA. Medido nas refs deste acervo (5 personagens, 6 fotos
+    # cada): mesma pessoa fica em 0,002-0,238; pessoas diferentes começam em
+    # 0,209 — separação folgada onde o CLIP empata.
+    #
+    # É VETO, não substituto. Só entra nas decisões apertadas do CLIP (as que
+    # passaram raspando o threshold), que é onde ele erra. Nas decisões
+    # confortáveis não é nem consultado — custaria CPU pra confirmar o óbvio.
+    ccip_veto: bool = True
+    ccip_veto_band: float = 0.06     # "apertada" = até isto acima do threshold
+    ccip_max_refs: int = 6           # rostos de referência por personagem
+    ccip_max_faces: int = 3          # rostos da cena comparados
+
     weak_ref_faces: int = 3          # menos que isto = referências fracas
     weak_ref_penalty: float = 0.03   # somado ao threshold desse personagem
     anchor_threshold: float = 0.88   # a cena que prova que ele está aqui
