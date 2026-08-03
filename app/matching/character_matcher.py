@@ -14,6 +14,12 @@ class CharacterEntry:
     # Multi-protótipo (P, d): um vetor por "modo visual" das refs (cabelo
     # solto vs preso, uniforme vs armadura...). None → matcher usa o centroide.
     prototypes: np.ndarray | None = None
+    #: Quantos ROSTOS de verdade foram detectados nas fotos de referência.
+    #: Não é o mesmo que quantidade de fotos: um retrato de corpo inteiro em
+    #: que o YOLO não achou rosto vira recorte central da imagem, e um
+    #: protótipo feito só disso compara pose e fundo, não rosto. É o número
+    #: que diz se dá pra confiar nas refs deste personagem.
+    ref_faces: int = 0
 
 
 def build_centroid(reference_embeddings: np.ndarray) -> np.ndarray | None:

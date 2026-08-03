@@ -189,6 +189,27 @@ class Config:
     # rosto não contam), a decisão vira sugestão no batismo — caso real:
     # cluster de 17 rostos auto-nomeado com protótipos de 2 retratinhos.
     cluster_min_ref_faces: int = 3
+
+    # --- anti-fantasma ---
+    #
+    # O caso: um personagem que NÃO está no episódio aparece com duas ou três
+    # cenas raspando o threshold, e vira pasta. Quem quase sempre faz isso é
+    # quem tem referências fracas — poucos rostos detectados nas fotos —
+    # porque os protótipos dele acabam representando pose e fundo em vez de
+    # rosto, e pose e fundo casam com qualquer coisa.
+    #
+    # Duas exigências, nessa ordem:
+    #  1) refs fracas pagam régua mais alta pra cada cena (`weak_ref_penalty`);
+    #  2) e o personagem só EXISTE no episódio se cravar pelo menos uma cena
+    #     bem acima da dúvida (`anchor_threshold`) — a cena-âncora. Sem
+    #     nenhuma, as atribuições automáticas dele caem inteiras.
+    #
+    # A âncora é o ponto: exigir só "mais cenas" não resolve, porque refs
+    # ruins erram MUITAS cenas com a mesma confiança medíocre. Uma única
+    # certeza vale mais que dez talvez.
+    weak_ref_faces: int = 3          # menos que isto = referências fracas
+    weak_ref_penalty: float = 0.03   # somado ao threshold desse personagem
+    anchor_threshold: float = 0.88   # a cena que prova que ele está aqui
     face_crop_padding: float = 0.25         # around detected face; more context helps CLIP
     # AI hybrid mode crops get WIDER padding so hair/headband is fully
     # visible — that's often the only thing telling apart similar-styled

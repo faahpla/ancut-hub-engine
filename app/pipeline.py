@@ -355,13 +355,19 @@ class Pipeline:
             self.db.set_character_embedding(
                 db_row["id"], to_bytes(centroid), reference_count=len(paths)
             )
+            # Referência fraca paga régua mais alta. Um personagem cujos
+            # protótipos vieram de retratos sem rosto detectável compara
+            # pose e fundo, não rosto — e isso casa com meio episódio.
+            fraca = faces_found < cfg.weak_ref_faces
             entries.append(
                 CharacterEntry(
                     id=db_row["id"],
                     name=ch.name,
                     centroid=centroid,
-                    threshold=cfg.default_threshold,
+                    threshold=cfg.default_threshold
+                    + (cfg.weak_ref_penalty if fraca else 0.0),
                     prototypes=protos,
+                    ref_faces=faces_found,
                 )
             )
         ref_cache.save()
@@ -1108,6 +1114,7 @@ class Pipeline:
             low_refs_warning=low_refs_warning,
             merge_snapshot=merge_snapshot,
             benchmark=benchmark,
+            weak_names={e.name for e in entries if e.ref_faces < cfg.weak_ref_faces},
         )
         result.leftover_groups = leftover_result
         # Sem timings no modo medição: a rodada do benchmark pula o corte e
@@ -1136,6 +1143,7 @@ class Pipeline:
         low_refs_warning: str | None = None,
         merge_snapshot: list[dict] | None = None,
         benchmark: bool = False,
+        weak_names: set[str] | None = None,
     ) -> PipelineResult:
         """Shared end-of-pipeline stage for both CLIP and AI paths:
           - drop characters below min_shots_per_character (cleans DB too)
@@ -1159,6 +1167,35 @@ class Pipeline:
             dropped.append(f"{name}({count})")
         if dropped:
             print(f"[CorteCenas] Removidos (poucos shots): {', '.join(dropped)}")
+
+        # Anti-fantasma: personagem de referências fracas precisa de uma
+        # CENA-ÂNCORA — pelo menos uma identificação bem acima da dúvida.
+        # Sem ela, tudo que ele tem são talvez, e talvez não viram pasta.
+        #
+        # Fica AQUI, antes da curadoria manual, pelo mesmo motivo do corte por
+        # poucos-shots: o que o usuário decidiu é reaplicado depois e ganha de
+        # tudo. Se ele já disse que aquele personagem está na cena, a decisão
+        # dele volta por cima — o motor não tem voto sobre isso.
+        if weak_names:
+            sem_ancora: list[str] = []
+            melhor: dict[int, float] = {}
+            for assigns in self.db.assignments_for_episode(episode_id).values():
+                for a in assigns:
+                    melhor[a["id"]] = max(
+                        melhor.get(a["id"], 0.0), float(a["confidence"] or 0.0)
+                    )
+            for name in weak_names:
+                cid = name_to_id.get(name)
+                if cid is None or cid not in melhor:
+                    continue
+                if melhor[cid] < cfg.anchor_threshold:
+                    self.db.drop_low_count_character(episode_id, cid)
+                    sem_ancora.append(f"{name}({melhor[cid]:.2f})")
+            if sem_ancora:
+                print(
+                    "[CorteCenas] Removidos (refs fracas, nenhuma cena acima "
+                    f"de {cfg.anchor_threshold:.2f}): {', '.join(sem_ancora)}"
+                )
 
         idx_to_dbid = {
             shot.idx: sid for (shot, _f, _k), sid in zip(cut_results, shot_db_ids)
