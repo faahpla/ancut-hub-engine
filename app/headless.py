@@ -837,6 +837,47 @@ def _has_analysis(
     _emit({"type": "has-analysis", "exists": exists})
 
 
+def _explorer_scan(episode_id: int) -> None:
+    """O que o usuário mexeu no Explorer desde a última vez."""
+    from .config import Config
+    from .storage.db import Database
+    from .storage.explorer_sync import ler
+
+    cfg = Config.load()
+    db = Database(cfg.cache_path / "index.db")
+    with db.connect() as c:
+        row = c.execute(
+            "SELECT output_root FROM episode WHERE id=?", (episode_id,)
+        ).fetchone()
+    if row is None or not row["output_root"]:
+        _emit({"type": "explorer-changes", "safe": False,
+               "reason": "pasta do episódio desconhecida",
+               "missingClips": 0, "unlinkedPairs": [], "missingFolders": []})
+        return
+    _emit({"type": "explorer-changes", **ler(row["output_root"], db, episode_id).payload()})
+
+
+def _explorer_apply(episode_id: int, character_ids: list[int]) -> None:
+    """Aplica a faxina do Explorer. As pastas só entram se confirmadas."""
+    from .config import Config
+    from .storage.db import Database
+    from .storage.explorer_sync import aplicar, ler
+
+    cfg = Config.load()
+    db = Database(cfg.cache_path / "index.db")
+    with db.connect() as c:
+        row = c.execute(
+            "SELECT output_root FROM episode WHERE id=?", (episode_id,)
+        ).fetchone()
+    if row is None or not row["output_root"]:
+        _emit({"type": "failed", "message": "pasta do episódio desconhecida"})
+        return
+    # Relê agora em vez de confiar no que a interface mandou: entre a
+    # pergunta e o "sim" o disco pode ter mudado de novo.
+    mudancas = ler(row["output_root"], db, episode_id)
+    _emit({"type": "explorer-applied", **aplicar(db, episode_id, mudancas, character_ids)})
+
+
 def _orphans() -> None:
     """Pastas de episódio na saída que o histórico não conhece."""
     from .config import Config
@@ -1049,6 +1090,11 @@ def _run() -> int:
 
         pipeline = Pipeline(cfg)
 
+        if req.get("cutOnly"):
+            result = pipeline.run_cut_only(info, on_progress=on_progress)
+            _emit({"type": "done", "result": _result_payload(result)})
+            return 0
+
         if req.get("discovery"):
             disc = pipeline.run_discovery(info, on_progress=on_progress)
             return _discovery_naming_round(pipeline, disc, on_progress, cancel)
@@ -1219,6 +1265,12 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if mode == "delete":
             _delete_shots(int(args[1]), [int(a) for a in args[2:]])
+            return 0
+        if mode == "explorer-scan":
+            _explorer_scan(int(args[1]))
+            return 0
+        if mode == "explorer-apply":
+            _explorer_apply(int(args[1]), [int(a) for a in args[2:]])
             return 0
         if mode == "orphans":
             _orphans()

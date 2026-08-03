@@ -1261,6 +1261,94 @@ class Pipeline:
             refs_dir=refs_dir,
         )
 
+    def run_cut_only(
+        self, info: EpisodeInfo, on_progress: ProgressCb | None = None
+    ) -> PipelineResult:
+        """Só picar o episódio em cenas. Sem internet, sem identificação.
+
+        Existe pra dois usos que hoje pagam pelo caminho inteiro:
+
+        - **sem rede** — quando as fontes estão fora do ar, a análise morre
+          em "nenhum personagem com refs" depois de já ter cortado tudo. Aqui
+          o corte é o objetivo, e ele nunca dependeu de rede.
+        - **quando o reconhecimento não interessa** — o usuário quer as cenas
+          pra escolher a olho.
+
+        E não é trabalho jogado fora: as cenas e os bounds ficam em cache, e
+        analisar depois começa do corte já pronto.
+        """
+        timer = StageTimer()
+        cb = timer.wrap(on_progress or _noop)
+        cfg = self.cfg
+
+        cb("parse", 1.0, f"{info.anime} {info.slug}")
+        # Só a memória local de pastas: consultar a franquia exigiria rede, e
+        # "sem internet" é metade da razão deste modo existir.
+        pastas = AnimeFolderStore(cfg.cache_path)
+        pasta_anime = (
+            (sanitize(info.output_folder) if info.output_folder else "")
+            or pastas.folder_for_name(info.anime)
+            or sanitize(info.anime)
+        )
+        episode_root, metadata_dir, cut_results = self._prepare_shots(
+            info, cb, pasta_anime
+        )
+        pastas.remember(info.anime, pasta_anime)
+
+        anime_id = self.db.upsert_anime(anilist_id=None, title=info.anime)
+        episode_id = self.db.upsert_episode(
+            anime_id, info.season, info.episode, str(info.source), info.kind
+        )
+        self.db.set_episode_root(episode_id, str(episode_root))
+        self.db.clear_episode_shots(episode_id)
+
+        cb("organize", -1.0, "Gravando as cenas...")
+        payload = []
+        for shot, shot_file, kfs in cut_results:
+            main_kf = kfs[len(kfs) // 2] if kfs else None
+            self.db.insert_shot(
+                episode_id=episode_id,
+                idx=shot.idx,
+                file=str(shot_file.relative_to(episode_root)),
+                keyframe=str(main_kf.relative_to(episode_root)) if main_kf else None,
+                start=shot.start,
+                end=shot.end,
+            )
+            payload.append(
+                build_shot_payload(
+                    {
+                        "idx": shot.idx,
+                        "file": str(shot_file.relative_to(episode_root)).replace("\\", "/"),
+                        "keyframe": (
+                            str(main_kf.relative_to(episode_root)).replace("\\", "/")
+                            if main_kf else None
+                        ),
+                        "start": shot.start,
+                        "end": shot.end,
+                    },
+                    info.anime, info.season, info.episode, [],
+                )
+            )
+        write_shots_json(metadata_dir / "shots.json", payload)
+        # characters.json vazio e não ausente: ausente significa "análise
+        # antiga, não sei o elenco" pra quem restaura pasta esquecida.
+        write_characters_json(metadata_dir / "characters.json", [])
+        cb("organize", 1.0, f"{len(cut_results)} cenas cortadas")
+        self._report_timings(timer, metadata_dir)
+
+        return PipelineResult(
+            episode_root=episode_root,
+            total_shots=len(cut_results),
+            total_characters=0,
+            identified_characters=[],
+            pair_counts={},
+            anime_title=info.anime,
+            season=info.season,
+            episode=info.episode,
+            episode_id=episode_id,
+            kind=info.kind,
+        )
+
     # ================= Modo Descoberta =================
 
     def run_discovery(
