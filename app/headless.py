@@ -290,8 +290,21 @@ def _probe() -> None:
             "version": __version__,
             "gpuName": gpu_name() if cuda_available() else None,
             "ffmpeg": ffmpeg_available(),
+            # Se a segunda opinião está de pé. Vale reportar porque ela falha
+            # em SILÊNCIO de propósito (a análise segue com o CLIP sozinho), e
+            # sem isto ninguém teria como saber que ela nunca entrou.
+            "ccip": _ccip_pronto(),
         }
     )
+
+
+def _ccip_pronto() -> bool:
+    """onnxruntime carrega? (não baixa o modelo — só confere a biblioteca)"""
+    try:
+        import onnxruntime  # noqa: F401
+        return True
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
