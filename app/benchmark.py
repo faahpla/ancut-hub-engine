@@ -61,6 +61,22 @@ CREATE TABLE IF NOT EXISTS bench_shot (
     PRIMARY KEY (case_id, shot_idx)
 );
 
+-- Apelidos: "o motor chamou de X, no gabarito isso é Y".
+--
+-- Existe porque nem toda divergência de nome é erro de reconhecimento. Um
+-- personagem batizado à mão no Modo Descoberta ganha o nome que o USUÁRIO
+-- deu ("Keigetsu Shu"); a rodada seguinte pega o elenco oficial e chama a
+-- mesma pessoa de outro jeito ("Shu, Gabi" — leitura diferente do mesmo
+-- kanji). O casamento por palavras não resolve isso, e não deveria mesmo:
+-- adivinhar que dois nomes sem palavra em comum são a mesma pessoa juntaria
+-- personagens diferentes. Quem afirma isso é uma pessoa, uma vez.
+CREATE TABLE IF NOT EXISTS bench_alias (
+    case_id INTEGER NOT NULL REFERENCES bench_case(id) ON DELETE CASCADE,
+    previsto TEXT NOT NULL,
+    verdadeiro TEXT NOT NULL,
+    PRIMARY KEY (case_id, previsto)
+);
+
 -- Verdade por NOME, não por id: o id é de um banco que pode ser
 -- reconstruído; o nome é o que sobrevive e é o que um humano consegue ler
 -- pra conferir se o gabarito faz sentido.
@@ -282,6 +298,25 @@ class BenchmarkStore:
             c.commit()
             return cur.rowcount > 0
 
+    def set_alias(self, case_id: int, previsto: str, verdadeiro: str) -> None:
+        with self._connect() as c:
+            c.execute(
+                "INSERT OR REPLACE INTO bench_alias(case_id, previsto, "
+                "verdadeiro) VALUES(?,?,?)",
+                (case_id, previsto, verdadeiro),
+            )
+            c.commit()
+
+    def aliases(self, case_id: int) -> dict[str, str]:
+        with self._connect() as c:
+            return {
+                str(r["previsto"]): str(r["verdadeiro"])
+                for r in c.execute(
+                    "SELECT previsto, verdadeiro FROM bench_alias WHERE case_id=?",
+                    (case_id,),
+                )
+            }
+
     def truth(self, case_id: int) -> tuple[set[int], dict[int, set[str]]]:
         """(universo de cenas, {shot_idx: {nomes}})."""
         with self._connect() as c:
@@ -310,7 +345,9 @@ def _slug(ep) -> str:
 
 
 def _canonicalize(
-    pred: dict[int, set[str]], truth_names: set[str]
+    pred: dict[int, set[str]],
+    truth_names: set[str],
+    aliases: dict[str, str] | None = None,
 ) -> dict[int, set[str]]:
     """Traduz os nomes da previsão para os nomes do gabarito.
 
@@ -329,10 +366,13 @@ def _canonicalize(
 
     alvos = sorted(truth_names)
     memo: dict[str, str] = {}
+    aliases = aliases or {}
 
     def canon(n: str) -> str:
         if n not in memo:
-            memo[n] = find_token_match(n, alvos) or n
+            # O apelido declarado à mão ganha: ele é afirmação, o casamento
+            # por palavras é dedução.
+            memo[n] = aliases.get(n) or find_token_match(n, alvos) or n
         return memo[n]
 
     return {idx: {canon(n) for n in ns} for idx, ns in pred.items()}
@@ -342,10 +382,11 @@ def score(
     universe: set[int],
     truth: dict[int, set[str]],
     pred: dict[int, set[str]],
+    aliases: dict[str, str] | None = None,
 ) -> list[CharScore]:
     """Compara verdade e previsão dentro do universo de cenas do gabarito."""
     truth_names = {n for idx, ns in truth.items() if idx in universe for n in ns}
-    pred = _canonicalize(pred, truth_names)
+    pred = _canonicalize(pred, truth_names, aliases)
 
     names: set[str] = set()
     for d in (truth, pred):
@@ -460,7 +501,7 @@ def run_case(
 
     return CaseResult(
         label=case.label,
-        chars=score(universe, truth, pred),
+        chars=score(universe, truth, pred, store.aliases(case.id)),
         seconds=time.monotonic() - t0,
         shots_scored=len(universe),
     )
@@ -556,6 +597,10 @@ def _cli(argv: list[str]) -> int:
     p_add.add_argument("episode_id", type=int)
     p_add.add_argument("--label", default="")
     p_add.add_argument("--notes", default="")
+    p_al = sub.add_parser("alias", help="declara que dois nomes são a mesma pessoa")
+    p_al.add_argument("label")
+    p_al.add_argument("previsto", help="como o motor chama")
+    p_al.add_argument("verdadeiro", help="como o gabarito chama")
     p_rm = sub.add_parser("remove", help="apaga um gabarito")
     p_rm.add_argument("label")
     p_run = sub.add_parser("run", help="mede o reconhecimento nos gabaritos")
@@ -588,6 +633,15 @@ def _cli(argv: list[str]) -> int:
             f"gabarito '{case.label}': {case.shot_count} cenas, "
             f"{case.truth_count} identificações"
         )
+        return 0
+
+    if args.cmd == "alias":
+        alvos = [c for c in store.cases() if c.label.lower() == args.label.lower()]
+        if not alvos:
+            print("não achei esse gabarito")
+            return 1
+        store.set_alias(alvos[0].id, args.previsto, args.verdadeiro)
+        print(f"'{args.previsto}' = '{args.verdadeiro}' em {alvos[0].label}")
         return 0
 
     if args.cmd == "remove":

@@ -679,15 +679,18 @@ def _merge_shots(episode_id: int, shot_ids: list[int]) -> None:
 
 
 def _delete_shots(episode_id: int, shot_ids: list[int]) -> None:
-    """Apaga cenas de vez: o clipe, os hardlinks e o keyframe.
+    """Tira cenas do episódio: o clipe, os hardlinks e o keyframe.
 
     Diferente do merge, que só tira de `shots/`. Aqui o usuário está dizendo
     que a cena não presta, então ela some também de `by_character/` e
     `by_pair/` — senão continuaria aparecendo nos resultados e nas pastas.
 
-    Como aquelas entradas são hardlinks pro MESMO arquivo, o conteúdo só morre
-    quando o último link cai. Por isso todos são removidos: deixar um pra trás
-    faria o arquivo sobreviver escondido, ocupando espaço sem aparecer.
+    Como aquelas entradas são hardlinks pro MESMO arquivo, o conteúdo só some
+    quando o último link cai. Por isso todos saem: deixar um pra trás faria o
+    arquivo sobreviver escondido, ocupando espaço sem aparecer.
+
+    O clipe em si NÃO é destruído — vai pra `_lixeira/<data-hora>` dentro da
+    pasta do episódio (ver `storage/lixeira.py`).
     """
     from .config import Config
     from .storage.db import Database
@@ -714,28 +717,28 @@ def _delete_shots(episode_id: int, shot_ids: list[int]) -> None:
         _emit({"type": "failed", "message": "cenas não encontradas"})
         return
 
-    arquivos = 0
-    for shot in alvos:
-        nome = Path(shot["file"]).name
-        caminhos = [episode_root / shot["file"]]
-        # Os hardlinks levam o mesmo nome de arquivo em cada pasta.
-        for pasta in ("by_character", "by_pair"):
-            caminhos += list((episode_root / pasta).glob(f"*/{nome}"))
-        if shot["keyframe"]:
-            caminhos.append(episode_root / shot["keyframe"])
-        for p in caminhos:
-            try:
-                p.unlink()
-                arquivos += 1
-            except OSError:
-                pass
+    # Lixeira em vez de destruir. Mover dentro do mesmo volume é instantâneo
+    # e não custa espaço nenhum a mais — e um clique errado numa seleção de
+    # 40 cenas deixa de significar reanalisar o episódio inteiro.
+    from .storage.lixeira import recolher
+
+    recolhido = recolher(
+        episode_root,
+        [
+            {"idx": s["idx"], "file": s["file"], "keyframe": s["keyframe"]}
+            for s in alvos
+        ],
+    )
+    for falha in recolhido.falhas:
+        print(f"[CorteCenas] lixeira: {falha}", flush=True)
 
     db.delete_shots([s["id"] for s in alvos])
 
     _emit({
         "type": "deleted",
         "deletedCount": len(alvos),
-        "files": arquivos,
+        "files": recolhido.movidos,
+        "trashDir": str(recolhido.destino),
     })
 
 
@@ -832,6 +835,40 @@ def _has_analysis(
     except Exception:
         pass
     _emit({"type": "has-analysis", "exists": exists})
+
+
+def _orphans() -> None:
+    """Pastas de episódio na saída que o histórico não conhece."""
+    from .config import Config
+    from .storage.db import Database
+    from .storage.recovery import scan
+
+    cfg = Config.load()
+    db = Database(cfg.cache_path / "index.db")
+    try:
+        _backfill_episode_roots(db, cfg.output_path)
+    except Exception:
+        pass  # o backfill é oportunista; a varredura vale de qualquer jeito
+    achadas = scan(cfg.output_path, db)
+    _emit({"type": "orphans", "episodes": [o.payload() for o in achadas]})
+
+
+def _restore(root: str) -> None:
+    """Devolve uma pasta esquecida pro histórico, sem reanalisar."""
+    from .config import Config
+    from .storage.db import Database
+    from .storage.recovery import restore
+
+    cfg = Config.load()
+    db = Database(cfg.cache_path / "index.db")
+    r = restore(root, db)
+    _emit({
+        "type": "restored",
+        "episodeId": r.episode_id,
+        "shots": r.shots,
+        "assignments": r.assignments,
+        "ignored": r.ignored,
+    })
 
 
 def _anime_folder(anime: str) -> None:
@@ -1182,6 +1219,12 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if mode == "delete":
             _delete_shots(int(args[1]), [int(a) for a in args[2:]])
+            return 0
+        if mode == "orphans":
+            _orphans()
+            return 0
+        if mode == "restore":
+            _restore(args[1])
             return 0
         if mode == "anime-folder":
             _anime_folder(args[1] if len(args) > 1 else "")
