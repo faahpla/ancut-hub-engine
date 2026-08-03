@@ -151,6 +151,90 @@ def extract_keyframes(
     return paths
 
 
+#: Até quantos quadros vale a pena AVANÇAR em vez de pedir um seek.
+#:
+#: Buscar posição num HEVC 10-bit não é barato: o decodificador volta pro
+#: keyframe anterior e decodifica tudo de novo até o alvo. Avançar já
+#: decodificado com `grab()` (sem converter em imagem) é muito mais barato
+#: por quadro — mas só até certo ponto. 250 quadros ≈ 10s de vídeo, que é
+#: cerca do intervalo entre keyframes de um encode típico: acima disso o
+#: seek volta a compensar.
+_AVANCO_MAXIMO = 250
+
+
+def extract_keyframes_batch(
+    video_path: str | Path,
+    pedidos: list[tuple[int, list[int]]],
+    out_dir: Path,
+    quality: int = 90,
+) -> dict[int, list[Path]]:
+    """Extrai keyframes de VÁRIAS cenas numa passada só pelo vídeo.
+
+    Medido em episódio real (404 cenas, HEVC 10-bit 1080p): a extração cena
+    a cena custava 504ms por cena, **43% da etapa de corte inteira**. Não é
+    a decodificação: é abrir o arquivo e buscar posição 3x por cena, 1212
+    vezes no episódio, cada uma obrigando o decodificador a voltar pro
+    keyframe anterior.
+
+    Aqui é um `VideoCapture` só, com os quadros pedidos em ORDEM. Quando o
+    próximo alvo está perto, avança com `grab()`; quando está longe, aí sim
+    busca. Os quadros são os MESMOS de antes, do mesmo arquivo — isto é
+    ordem de leitura, não mudança de fonte. (Extrair do clipe já cortado
+    seria mais rápido ainda, mas passaria os pixels por mais uma geração de
+    compressão, e são esses pixels que alimentam o reconhecimento.)
+
+    `pedidos`: [(idx da cena, [números de quadro])]. Devolve {idx: [jpgs]}.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    saida: dict[int, list[Path]] = {}
+    if not pedidos:
+        return saida
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        return saida
+
+    # (quadro, idx da cena, k) ordenado — é a ordem que torna a leitura linear.
+    alvos = sorted(
+        (frame, idx, k)
+        for idx, frames in pedidos
+        for k, frame in enumerate(frames)
+    )
+
+    pos = -1
+    try:
+        for frame_no, idx, k in alvos:
+            if pos < 0 or frame_no < pos or frame_no - pos > _AVANCO_MAXIMO:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
+                pos = frame_no
+            else:
+                while pos < frame_no:
+                    if not cap.grab():
+                        break
+                    pos += 1
+            ok, frame = cap.read()
+            if not ok:
+                continue
+            pos += 1
+            destino = out_dir / f"{idx:04d}_{k}.jpg"
+            cv2.imwrite(str(destino), frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+            saida.setdefault(idx, []).append(destino)
+    finally:
+        cap.release()
+
+    for lista in saida.values():
+        lista.sort()
+    return saida
+
+
+def frame_numbers_for(shot: ShotBounds, fps: float, n_frames: int) -> list[int]:
+    """Quais quadros do vídeo representam esta cena. Mesma regra de sempre."""
+    offsets = [0.5] if n_frames <= 1 else [
+        (i + 1) / (n_frames + 1) for i in range(n_frames)
+    ]
+    return [int((shot.start + shot.duration * o) * fps) for o in offsets]
+
+
 def cut_all_shots(
     video_path: str | Path,
     shots: list[ShotBounds],
@@ -228,9 +312,42 @@ def cut_all_shots(
     workers = _NVENC_WORKERS if enc_state["nvenc"] else _CPU_WORKERS
     workers = max(1, min(workers, os.cpu_count() or 4, total or 1))
 
+    # --- keyframes: uma passada só, ANTES do corte ---
+    #
+    # Fica fora do pool de propósito. As três leituras de uma cena são
+    # aleatórias no arquivo, e três threads pedindo posições diferentes no
+    # mesmo vídeo brigam pelo mesmo decodificador. Em ordem, sequencial, uma
+    # `VideoCapture` só, sai mais barato do que paralelo mal feito.
+    esperados = {
+        s.idx: [keyframes_dir / f"{s.idx:04d}_{k}.jpg" for k in range(keyframes_per_shot)]
+        for s in shots
+    }
+    faltando = [
+        s for s in shots
+        if not (skip_existing and all(
+            p.exists() and p.stat().st_size > 0 for p in esperados[s.idx]
+        ))
+    ]
+    # E roda EM PARALELO com os cortes, não antes deles: extrair keyframe é
+    # decodificação na CPU, cortar clipe é codificação na GPU (NVENC). São
+    # recursos diferentes, então uma espera não precisa custar a outra.
+    extraidos: dict[int, list[Path]] = {}
+    kf_pool = ThreadPoolExecutor(max_workers=1) if faltando else None
+    kf_future = (
+        kf_pool.submit(
+            extract_keyframes_batch,
+            video_path,
+            [(s.idx, frame_numbers_for(s, video_fps, keyframes_per_shot))
+             for s in faltando],
+            keyframes_dir,
+        )
+        if kf_pool
+        else None
+    )
+
     def process(shot: ShotBounds) -> tuple[ShotBounds, Path, list[Path], bool] | None:
         out_file = shots_dir / f"{shot.idx:04d}.mp4"
-        expected_kfs = [keyframes_dir / f"{shot.idx:04d}_{k}.jpg" for k in range(keyframes_per_shot)]
+        expected_kfs = esperados[shot.idx]
 
         have_cut = out_file.exists() and out_file.stat().st_size > 0
         have_kfs = all(p.exists() and p.stat().st_size > 0 for p in expected_kfs)
@@ -257,10 +374,10 @@ def cut_all_shots(
                 else:
                     return None
 
-        if skip_existing and have_kfs:
-            kfs = expected_kfs
-        else:
-            kfs = extract_keyframes(video_path, shot, keyframes_dir, n_frames=keyframes_per_shot)
+        # Os keyframes desta cena talvez ainda estejam sendo extraídos na
+        # outra thread — a lista definitiva é preenchida depois do join.
+        # Ler `extraidos` aqui seria corrida: o dicionário está sendo escrito.
+        kfs = expected_kfs if have_kfs else []
 
         # "Pulado" no contador de progresso significa que NADA foi refeito —
         # com o formato trocado o clipe é recortado, então não conta.
@@ -287,7 +404,24 @@ def cut_all_shots(
             # shots already encoding finish into the cache and get reused on
             # the next run.
             pool.shutdown(wait=False, cancel_futures=True)
+            if kf_pool:
+                kf_pool.shutdown(wait=False, cancel_futures=True)
             raise
 
-    # Original shot order, minus the ones ffmpeg couldn't cut.
-    return [r for r in indexed if r is not None]
+    if kf_future is not None:
+        try:
+            extraidos = kf_future.result()
+        except Exception as e:  # noqa: BLE001 — sem keyframe a cena segue viva
+            print(f"[CorteCenas] falha extraindo keyframes: {e}", flush=True)
+        finally:
+            kf_pool.shutdown(wait=True)  # type: ignore[union-attr]
+
+    # Agora sim: quem ficou sem keyframe na hora do corte recebe os da
+    # passada paralela.
+    resultado: list[tuple[ShotBounds, Path, list[Path]]] = []
+    for r in indexed:
+        if r is None:
+            continue  # ffmpeg não cortou esta cena
+        shot, out_file, kfs = r
+        resultado.append((shot, out_file, kfs or extraidos.get(shot.idx, [])))
+    return resultado
