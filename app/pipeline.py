@@ -60,6 +60,7 @@ from .references.reference_store import ReferenceStore
 from .shot_detection import ShotBounds, detect_shots
 from .storage.db import Database
 from .storage.metadata_writer import build_shot_payload, write_characters_json, write_shots_json
+from .storage.anime_folders import AnimeFolderStore
 from .storage.organizer import clear_grouping, organize_by_character, organize_by_pair, sanitize
 from .video_ingest import EpisodeInfo
 
@@ -90,6 +91,21 @@ def _clip_needs_download(model_name: str, pretrained: str) -> bool:
         return False
 
 
+def _cache_id_for(bundle) -> str:
+    """Chave de cache do anime — a da FRANQUIA quando ela existe.
+
+    Todas as temporadas dividem o mesmo banco de referências, e é esta mesma
+    chave que amarra as temporadas numa pasta só de saída.
+    """
+    if bundle.cache_id_override:
+        return bundle.cache_id_override   # banco local (Modo Descoberta)
+    if bundle.franchise_root_id:
+        return f"al{bundle.franchise_root_id}"
+    if bundle.anilist_id:
+        return f"al{bundle.anilist_id}"
+    return f"mal{bundle.mal_id}"
+
+
 def _noop(stage: str, frac: float, msg: str) -> None:
     pass
 
@@ -108,14 +124,35 @@ class Pipeline:
         ai_mode: AIMode | str = AIMode.FULL,
         ai_review_ambiguous: bool = False,
         merge_previous: bool = False,
+        benchmark: bool = False,
     ) -> PipelineResult:
+        """`benchmark=True`: rodada de MEDIÇÃO, não de produção.
+
+        Duas diferenças, e as duas existem pelo mesmo motivo. A curadoria
+        manual do usuário é o GABARITO do benchmark — se a rodada aplicasse
+        os bloqueios e as adições dele, ela estaria copiando a resposta da
+        prova e tirando 100 sempre. Então aqui a curadoria não entra nem na
+        classificação nem no fim.
+
+        E nada é organizado em pasta: medir não pode mexer no acervo. O
+        banco é responsabilidade de quem chama (o runner usa uma cópia).
+        """
         timer = StageTimer()
         cb = timer.wrap(on_progress or _noop)
         cfg = self.cfg
 
-        episode_root, metadata_dir, cut_results = self._prepare_shots(info, cb)
+        cb("parse", 1.0, f"{info.anime} {info.slug}")
 
-        # 3) Anime / characters
+        # 3) Anime / characters — ANTES de preparar as pastas, de propósito.
+        #
+        # Quem decide em que pasta o episódio cai é a identidade do anime, e
+        # a identidade só existe depois desta consulta. Enquanto o corte vinha
+        # primeiro, a pasta era o nome digitado e nada mais — foi assim que
+        # "Tensura", "Tensei Shitara Slime Datta Ken" e "That Time I Got
+        # Reincarnated as a Slime" viraram três pastas do mesmo anime.
+        #
+        # Custa nada trocar a ordem: com o anime já conhecido esta etapa sai
+        # do cache em ~0s (ver o disjuntor e o banco parcial na v1.8.1).
         cb("fetch_characters", -1.0, "Consultando AniList + Jikan...")
         provider = AnimeProvider(cfg.cache_path)
         try:
@@ -138,6 +175,33 @@ class Pipeline:
             print(f"[CorteCenas] AVISO de fonte: {w}", flush=True)
         cb("fetch_characters", 1.0, f"{len(bundle.characters)} personagens")
 
+        # A chave da FRANQUIA, não da temporada: no AniList cada temporada é
+        # um anime diferente, e o usuário quer uma pasta pro anime inteiro.
+        cache_id = _cache_id_for(bundle)
+        pastas = AnimeFolderStore(cfg.cache_path)
+        pastas.seed_from_history(cfg.cache_path, cfg.output_path)
+        pasta_anime = (
+            # `sanitize("")` devolve "unknown", não "" — por isso o teste vem
+            # antes da chamada, e não depois dela.
+            (sanitize(info.output_folder) if info.output_folder else "")
+            or pastas.folder_for_name(info.anime)
+            or pastas.folder_for_franchise(cache_id)
+            or sanitize(info.anime)
+        )
+        if pasta_anime != sanitize(info.anime):
+            print(
+                f"[CorteCenas] Pasta do anime: '{pasta_anime}' "
+                f"(digitado: '{info.anime}')",
+                flush=True,
+            )
+
+        episode_root, metadata_dir, cut_results = self._prepare_shots(
+            info, cb, pasta_anime
+        )
+        # Só depois do corte dar certo: uma análise que morreu no meio não
+        # deve deixar combinação de pasta pra trás.
+        pastas.remember(info.anime, pasta_anime, cache_id)
+
         anime_id = self.db.upsert_anime(
             anilist_id=bundle.anilist_id,
             mal_id=bundle.mal_id,
@@ -156,7 +220,7 @@ class Pipeline:
         # ANTES de limpar — elas voltam por cima do resultado novo no final
         # (a análise nova ganha nos empates; bloqueios manuais ganham de tudo).
         merge_snapshot: list[dict] = []
-        if merge_previous:
+        if merge_previous and not benchmark:
             merge_snapshot = self.db.assignments_snapshot(episode_id)
             if merge_snapshot:
                 print(
@@ -172,7 +236,7 @@ class Pipeline:
         # re-atribuída no meio da análise — senão ela vira fonte da segunda
         # passada e ESPALHA o erro que o usuário corrigiu.
         blocked_pairs: dict[int, set[int]] = {}
-        for ov in self.db.manual_overrides(episode_id):
+        for ov in [] if benchmark else self.db.manual_overrides(episode_id):
             if ov["action"] == "block":
                 blocked_pairs.setdefault(int(ov["shot_idx"]), set()).add(
                     int(ov["character_id"])
@@ -197,16 +261,8 @@ class Pipeline:
         # 4) Download references
         cb("download_refs", -1.0, "Baixando imagens de personagens...")
         ref_store = ReferenceStore(cfg.cache_path)
-        # Franchise root ID, when present, is the shared cache key for the
-        # whole franchise (all seasons share refs).
-        if bundle.cache_id_override:
-            cache_id = bundle.cache_id_override   # banco local (Modo Descoberta)
-        elif bundle.franchise_root_id:
-            cache_id = f"al{bundle.franchise_root_id}"
-        elif bundle.anilist_id:
-            cache_id = f"al{bundle.anilist_id}"
-        else:
-            cache_id = f"mal{bundle.mal_id}"
+        # `cache_id` já foi calculado lá em cima: é ele que escolhe a pasta
+        # do anime, e a pasta precisa ser decidida antes do corte.
 
         # Pastas locais de personagem que NÃO batem com o elenco online
         # também são personagens (Modo Descoberta com nome digitado, pastas
@@ -1051,9 +1107,14 @@ class Pipeline:
             refs_dir=refs_dir_str,
             low_refs_warning=low_refs_warning,
             merge_snapshot=merge_snapshot,
+            benchmark=benchmark,
         )
         result.leftover_groups = leftover_result
-        self._report_timings(timer, metadata_dir)
+        # Sem timings no modo medição: a rodada do benchmark pula o corte e
+        # sai de cache: gravar esses tempos por cima estragaria o histórico
+        # que responde "onde o tempo mora" (ver metadata/timings.json).
+        if not benchmark:
+            self._report_timings(timer, metadata_dir)
         return result
 
     def _finalize_episode(
@@ -1074,6 +1135,7 @@ class Pipeline:
         refs_dir: str | None = None,
         low_refs_warning: str | None = None,
         merge_snapshot: list[dict] | None = None,
+        benchmark: bool = False,
     ) -> PipelineResult:
         """Shared end-of-pipeline stage for both CLIP and AI paths:
           - drop characters below min_shots_per_character (cleans DB too)
@@ -1106,7 +1168,7 @@ class Pipeline:
         # anterior por cima do resultado novo (INSERT OR IGNORE — a análise
         # nova ganha quando o par já existe). Vem antes da curadoria manual,
         # que ainda ganha de tudo (bloqueio remove inclusive o que voltou).
-        if merge_snapshot:
+        if merge_snapshot and not benchmark:
             merged_back = 0
             for snap in merge_snapshot:
                 sid = idx_to_dbid.get(snap["shot_idx"])
@@ -1127,7 +1189,7 @@ class Pipeline:
         # Curadoria manual lembrada de análises anteriores: bloqueios tiram o
         # que a IA re-adicionou, adições devolvem o que o usuário confirmou.
         # Vem DEPOIS do drop de poucos-shots pra decisão do usuário ganhar.
-        overrides = self.db.manual_overrides(episode_id)
+        overrides = [] if benchmark else self.db.manual_overrides(episode_id)
         if overrides:
             n_block = n_add = 0
             for ov in overrides:
@@ -1148,8 +1210,11 @@ class Pipeline:
             )
             cb("organize", -1.0, f"Curadoria manual: {n_block + n_add} decisões reaplicadas")
 
-        cb("organize", -1.0, "Gerando pastas e metadados...")
-        clear_grouping(episode_root)
+        cb("organize", -1.0,
+           "Lendo o resultado (sem mexer nas pastas)" if benchmark
+           else "Gerando pastas e metadados...")
+        if not benchmark:
+            clear_grouping(episode_root)
 
         # Pastas e contagens saem do BANCO (não das listas em memória): é o
         # banco que carrega o resultado final — automático + IA + curadoria.
@@ -1170,12 +1235,13 @@ class Pipeline:
             shots_payload.append(
                 build_shot_payload(shot_row, bundle.title, info.season, info.episode, assigns)
             )
-            if names:
+            if names and not benchmark:
                 organize_by_character(shot_file, episode_root, names)
                 organize_by_pair(shot_file, episode_root, names)
 
-        write_shots_json(metadata_dir / "shots.json", shots_payload)
-        write_characters_json(metadata_dir / "characters.json", characters_json)
+        if not benchmark:
+            write_shots_json(metadata_dir / "shots.json", shots_payload)
+            write_characters_json(metadata_dir / "characters.json", characters_json)
 
         pair_counts = dict(count_pairs(final_names))
         identified = sorted({n for names in final_names for n in names})
@@ -1206,7 +1272,19 @@ class Pipeline:
         timer = StageTimer()
         cb = timer.wrap(on_progress or _noop)
         cfg = self.cfg
-        episode_root, metadata_dir, cut_results = self._prepare_shots(info, cb)
+        cb("parse", 1.0, f"{info.anime} {info.slug}")
+        # Na Descoberta a identidade online é opcional, então aqui só vale a
+        # memória que NÃO depende de rede: a pasta já combinada pra este nome.
+        pastas = AnimeFolderStore(cfg.cache_path)
+        pasta_anime = (
+            (sanitize(info.output_folder) if info.output_folder else "")
+            or pastas.folder_for_name(info.anime)
+            or sanitize(info.anime)
+        )
+        episode_root, metadata_dir, cut_results = self._prepare_shots(
+            info, cb, pasta_anime
+        )
+        pastas.remember(info.anime, pasta_anime)
 
         # Identidade online é opcional na descoberta: se o anime resolver,
         # os grupos reforçam o banco REAL (refs em al<root>) e os nomes são
@@ -1627,14 +1705,22 @@ class Pipeline:
             refs_dir=str(store.anime_dir(result.cache_id) / "characters"),
         )
 
-    def _prepare_shots(self, info: EpisodeInfo, cb: ProgressCb):
+    def _prepare_shots(
+        self, info: EpisodeInfo, cb: ProgressCb, pasta_anime: str = ""
+    ):
         """Estágios comuns a TODAS as análises (normal e descoberta):
         layout de pastas, detecção de shots (com cache) e corte+keyframes.
-        Retorna (episode_root, metadata_dir, cut_results)."""
-        cfg = self.cfg
-        cb("parse", 1.0, f"{info.anime} {info.slug}")
+        Retorna (episode_root, metadata_dir, cut_results).
 
-        episode_root = cfg.output_path / sanitize(info.anime) / info.slug
+        `pasta_anime` vazio = usa o nome digitado, como sempre foi. Quem
+        chama com identidade em mãos (a análise normal) passa a pasta
+        combinada pro anime — ver `storage/anime_folders.py`.
+        """
+        cfg = self.cfg
+
+        episode_root = (
+            cfg.output_path / (pasta_anime or sanitize(info.anime)) / info.slug
+        )
         shots_dir = episode_root / "shots"
         keyframes_dir = episode_root / "keyframes"
         metadata_dir = episode_root / "metadata"

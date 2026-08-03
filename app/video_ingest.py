@@ -66,6 +66,10 @@ class EpisodeInfo:
     #: IDENTIDADE: sem isto a abertura da 2ª temporada ocupava a mesma vaga
     #: que o episódio 1 dela, e uma sobrescrevia a outra.
     kind: str = ""
+    #: Pasta do anime na saída, quando o usuário escolheu uma explicitamente.
+    #: Vazio = decide o motor (memória de pastas → nome digitado). Ver
+    #: `storage/anime_folders.py`.
+    output_folder: str = ""
 
     @property
     def slug(self) -> str:

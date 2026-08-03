@@ -1,0 +1,200 @@
+"""Uma pasta por anime, mesmo quando o nome é digitado de outro jeito.
+
+O problema é real e mensurável: no acervo do usuário havia **14 pastas para
+cerca de 6 animes**. Tensura sozinho ocupava quatro — "Tensura", "Tensei
+Shitara Slime Datta Ken", "That Time I Got Reincarnated as a Slime" e uma
+quarta com sufixo de OAD. São o mesmo anime; o que muda é o que ele digitou
+naquele dia, e o nome digitado é o que vira nome de pasta.
+
+**Por que não adivinhar sozinho.** "Tensura" e "That Time I Got Reincarnated
+as a Slime" não se parecem em nada como texto — nenhuma medida de
+similaridade junta as duas. O que junta é a IDENTIDADE: as duas resolvem pra
+mesma franquia. Só que a resolução acontece online, depois que a pasta já
+precisou existir.
+
+**Como isto resolve.** Duas memórias, ambas alimentadas no fim de cada
+análise, quando os dois fatos já são conhecidos:
+
+- `nomes`: nome digitado → pasta. Responde instantâneo e sem rede. Cobre o
+  caso mais comum, que é o usuário repetir uma grafia que já usou.
+- `franquias`: id da franquia → pasta. É o que faz "Tensura" de hoje cair na
+  pasta de "That Time I Got Reincarnated as a Slime" de outro dia, assim que
+  a resolução confirmar que são a mesma coisa.
+
+E a decisão nunca é tomada em silêncio: quem escolhe é o usuário, uma vez,
+e a escolha fica guardada. Adivinhar errado espalharia clipes por pastas
+erradas, que é pior do que o problema.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+
+class AnimeFolderStore:
+    """Arquivo em `<cache>/pastas_de_anime.json`."""
+
+    def __init__(self, cache_root: Path | str) -> None:
+        self.path = Path(cache_root) / "pastas_de_anime.json"
+
+    # --- leitura/escrita cruas ---
+
+    def _load(self) -> dict:
+        if not self.path.exists():
+            return {"nomes": {}, "franquias": {}}
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {"nomes": {}, "franquias": {}}
+        data.setdefault("nomes", {})
+        data.setdefault("franquias", {})
+        return data
+
+    def _save(self, data: dict) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(
+            json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+
+    # --- consulta ---
+
+    def folder_for_name(self, typed: str) -> str | None:
+        """Pasta já combinada pra este nome digitado. Sem rede."""
+        return self._load()["nomes"].get(_chave(typed))
+
+    def folder_for_franchise(self, franchise_key: str) -> str | None:
+        if not franchise_key:
+            return None
+        return self._load()["franquias"].get(str(franchise_key))
+
+    def remember(
+        self, typed: str, folder: str, franchise_key: str = ""
+    ) -> None:
+        """Grava a escolha. O nome sempre; a franquia quando ela é conhecida.
+
+        A pasta da franquia NÃO é sobrescrita depois de definida: se ela
+        mudasse a cada análise, as temporadas voltariam a se espalhar — que
+        é exatamente o que isto existe pra impedir.
+        """
+        if not typed or not folder:
+            return
+        data = self._load()
+        data["nomes"][_chave(typed)] = folder
+        if franchise_key:
+            data["franquias"].setdefault(str(franchise_key), folder)
+        self._save(data)
+
+    def forget(self, typed: str) -> None:
+        data = self._load()
+        if data["nomes"].pop(_chave(typed), None) is not None:
+            self._save(data)
+
+
+    # --- semeadura a partir do que já existe ---
+
+    def seed_from_history(self, cache_root: Path | str, output_dir: Path | str) -> int:
+        """Aproveita o histórico pra a memória já nascer cheia. Roda uma vez.
+
+        Sem isto o agrupamento só valeria daqui pra frente, e as pastas que já
+        estão espalhadas continuariam recebendo episódio novo. A matéria-prima
+        é o atalho de busca (`cache/anime_db/busca_resolvida.json`), que guarda
+        exatamente o par que interessa: **nome digitado → franquia**. As pastas
+        de saída são os mesmos nomes digitados, então o cruzamento fecha sem
+        rede nenhuma.
+
+        Quando a mesma franquia tem várias pastas, ganha a que tem MAIS
+        episódios dentro. É a que ele mais usa, e é o palpite que move menos
+        coisa de lugar. Nada é movido de qualquer forma — a escolha só vale
+        pros episódios seguintes.
+        """
+        data = self._load()
+        if data.get("semeado"):
+            return 0
+
+        atalho = Path(cache_root) / "anime_db" / "busca_resolvida.json"
+        try:
+            resolvidas = json.loads(atalho.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            resolvidas = {}
+
+        raiz = Path(output_dir)
+        candidatas: dict[str, list[tuple[int, str]]] = {}
+        nomes_da_franquia: dict[str, list[str]] = {}
+        for chave, cache_id in resolvidas.items():
+            digitado = str(chave).split("|")[0]
+            nomes_da_franquia.setdefault(str(cache_id), []).append(digitado)
+            pasta = _pasta_existente(raiz, digitado)
+            if pasta is None:
+                continue
+            candidatas.setdefault(str(cache_id), []).append(
+                (_conta_episodios(raiz / pasta), pasta)
+            )
+
+        gravadas = 0
+        for cache_id, opcoes in candidatas.items():
+            if cache_id in data["franquias"]:
+                continue
+            # O nome desempata, pra a escolha não depender da ordem do JSON.
+            _, escolhida = max(opcoes, key=lambda o: (o[0], o[1]))
+            data["franquias"][cache_id] = escolhida
+            # TODAS as grafias da franquia passam a apontar pra pasta
+            # escolhida. Mapear cada grafia pra pasta dela seria congelar a
+            # bagunça: continuaria existindo uma pasta por jeito de escrever,
+            # que é o problema. Nada é movido — os episódios que já estão em
+            # cada pasta ficam onde estão; muda o destino dos próximos.
+            for digitado in nomes_da_franquia.get(cache_id, []):
+                data["nomes"][_chave(digitado)] = escolhida
+            gravadas += 1
+
+        data["semeado"] = True
+        self._save(data)
+        return gravadas
+
+
+def _pasta_existente(raiz: Path, digitado: str) -> str | None:
+    """A pasta de saída que corresponde a este nome digitado, se existir.
+
+    Compara sem caixa: o nome vira pasta por `sanitize`, que não mexe em
+    maiúsculas, mas o Windows não distingue as duas.
+    """
+    from .organizer import sanitize
+
+    alvo = sanitize(digitado).lower()
+    try:
+        for p in raiz.iterdir():
+            if p.is_dir() and p.name.lower() == alvo:
+                return p.name
+    except OSError:
+        pass
+    return None
+
+
+def _conta_episodios(pasta: Path) -> int:
+    try:
+        return sum(1 for p in pasta.iterdir() if p.is_dir())
+    except OSError:
+        return 0
+
+
+def _chave(nome: str) -> str:
+    """Caixa e espaços não distinguem um anime de outro."""
+    return " ".join((nome or "").lower().split())
+
+
+def existing_folders(output_dir: Path | str) -> list[str]:
+    """Pastas de anime que já existem na saída, em ordem alfabética.
+
+    Serve pro campo de nome sugerir o que já está lá — o jeito mais barato
+    de evitar a 15ª grafia é mostrar as 14 anteriores antes de digitar.
+    """
+    root = Path(output_dir)
+    if not root.is_dir():
+        return []
+    try:
+        return sorted(
+            (p.name for p in root.iterdir() if p.is_dir() and not p.name.startswith(".")),
+            key=str.lower,
+        )
+    except OSError:
+        return []

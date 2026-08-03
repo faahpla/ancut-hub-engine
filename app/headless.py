@@ -834,6 +834,50 @@ def _has_analysis(
     _emit({"type": "has-analysis", "exists": exists})
 
 
+def _anime_folder(anime: str) -> None:
+    """Em que pasta este nome vai cair — e quais pastas já existem.
+
+    Consulta só o que é local: a memória de pastas e a listagem da saída.
+    Nada de rede, porque isto responde enquanto o usuário digita.
+    """
+    from .config import Config
+    from .storage.anime_folders import AnimeFolderStore, existing_folders
+    from .storage.organizer import sanitize
+
+    cfg = Config.load()
+    store = AnimeFolderStore(cfg.cache_dir)
+    store.seed_from_history(cfg.cache_dir, cfg.output_dir)
+    lembrada = store.folder_for_name(anime) if anime else None
+    _emit({
+        "type": "anime-folder",
+        "folder": lembrada or (sanitize(anime) if anime else ""),
+        "remembered": lembrada is not None,
+        "existing": existing_folders(cfg.output_dir),
+    })
+
+
+def _bench_add(episode_id: int, label: str = "") -> None:
+    """Congela este episódio como gabarito do benchmark.
+
+    Chamado quando o usuário diz "este aqui está certo". O que vira régua é
+    exatamente o que ele está vendo na tela — inclusive a curadoria que ele
+    acabou de fazer.
+    """
+    from .benchmark import BenchmarkStore
+    from .config import Config
+
+    cfg = Config.load()
+    store = BenchmarkStore(cfg.cache_dir)
+    case = store.snapshot(Path(cfg.cache_dir) / "index.db", episode_id, label=label)
+    _emit({
+        "type": "benchmark-case",
+        "label": case.label,
+        "shots": case.shot_count,
+        "truth": case.truth_count,
+        "total": len(store.cases()),
+    })
+
+
 def _skip_ranges(anime: str) -> None:
     """OP/ED salvos pra um anime (o usuário digitou o nome na mão)."""
     from .config import Config
@@ -936,6 +980,7 @@ def _run() -> int:
         # Tipo inventado vira episódio, pela mesma razão do render_export_mode:
         # um valor desconhecido não pode virar identidade em silêncio.
         kind=str(req.get("kind", "")).upper() if req.get("kind") in ("OP", "ED") else "",
+        output_folder=str(req.get("outputFolder", "") or ""),
     )
 
     import time
@@ -1137,6 +1182,12 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if mode == "delete":
             _delete_shots(int(args[1]), [int(a) for a in args[2:]])
+            return 0
+        if mode == "anime-folder":
+            _anime_folder(args[1] if len(args) > 1 else "")
+            return 0
+        if mode == "bench-add":
+            _bench_add(int(args[1]), args[2] if len(args) > 2 else "")
             return 0
         if mode == "harvest":
             _harvest(int(args[1]))
