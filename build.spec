@@ -64,6 +64,10 @@ hidden += [
     "PySide6.QtMultimedia",
     "PySide6.QtMultimediaWidgets",
     "PySide6.QtNetwork",   # dependência do QtMultimedia (streaming/rede)
+    # CCIP: importado tarde (só quando há decisão apertada pra conferir), e
+    # import tardio é justamente o que o PyInstaller não enxerga sozinho.
+    "onnxruntime",
+    "onnxruntime.capi._pybind_state",
 ]
 
 

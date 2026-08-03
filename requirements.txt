@@ -27,6 +27,10 @@ platformdirs>=4.2
 # small variant is 34ms/img on GPU.
 ultralytics>=8.1
 huggingface_hub>=0.20
+# CCIP: a segunda opinião sobre "esses dois desenhos são a mesma pessoa?".
+# CPU-only de propósito — o modelo tem 150 MB e roda em ~75s por episódio
+# sem GPU, e a GPU já está ocupada com o CLIP e o corte NVENC.
+onnxruntime>=1.17
 # Acelera o download dos modelos do HF Hub (CLIP ~890 MB na primeira análise).
 # Sem ele o hub cai em HTTP puro e loga um warning em toda instalação.
 hf_xet>=1.0
