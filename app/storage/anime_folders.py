@@ -29,7 +29,12 @@ erradas, que é pior do que o problema.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
+
+# Tudo que não é letra, número ou espaço — mais o sublinhado, que o `\w`
+# deixaria passar.
+_PONTUACAO = re.compile(r"[^\w\s]|_", re.UNICODE)
 
 
 class AnimeFolderStore:
@@ -49,6 +54,7 @@ class AnimeFolderStore:
             return {"nomes": {}, "franquias": {}}
         data.setdefault("nomes", {})
         data.setdefault("franquias", {})
+        data["nomes"] = _rechavear(data["nomes"])
         return data
 
     def _save(self, data: dict) -> None:
@@ -178,8 +184,42 @@ def _conta_episodios(pasta: Path) -> int:
 
 
 def _chave(nome: str) -> str:
-    """Caixa e espaços não distinguem um anime de outro."""
-    return " ".join((nome or "").lower().split())
+    """Caixa, espaços e PONTUAÇÃO não distinguem um anime de outro.
+
+    A pontuação entrou depois de custar caro. O mesmo anime chega com
+    pontuação diferente conforme a origem do nome:
+
+        "Mushoku Tensei III: Isekai Ittara Honki Dasu"   <- título da fonte
+        "Mushoku Tensei III - Isekai Ittara Honki Dasu"  <- nome do arquivo
+
+    Comparando só caixa e espaço, os dois são nomes diferentes — e o episódio
+    foi parar numa pasta nova, sozinho. Pior: o acerto é gravado no fim da
+    análise, então a pasta errada virava a escolha oficial e toda análise
+    seguinte ia atrás dela.
+
+    Trocar por espaço em vez de apagar é de propósito: "Fate/Zero" tem que
+    virar "fate zero", e não "fatezero".
+    """
+    sem_pontuacao = _PONTUACAO.sub(" ", (nome or "").lower())
+    return " ".join(sem_pontuacao.split())
+
+
+def _rechavear(nomes: dict) -> dict:
+    """Passa as chaves gravadas pela regra ATUAL, na leitura.
+
+    Sem isto, a mudança do `_chave` seria uma amnésia: todo mapeamento
+    gravado com a regra antiga (que guardava a pontuação) viraria inalcançável
+    de uma vez, e cada anime voltaria a inventar pasta na análise seguinte.
+
+    **Empate**: duas chaves velhas podem virar a mesma nova apontando pra
+    pastas diferentes — é justamente o sintoma que a mudança conserta. Vence a
+    PRIMEIRA, que é a mais antiga do arquivo: a pasta nova nasceu do erro, e a
+    velha é a que tem os episódios.
+    """
+    saida: dict[str, str] = {}
+    for nome, pasta in (nomes or {}).items():
+        saida.setdefault(_chave(nome), pasta)
+    return saida
 
 
 def existing_folders(output_dir: Path | str) -> list[str]:
