@@ -38,6 +38,18 @@ from .organizer import sanitize
 # deixaria passar.
 _PONTUACAO = re.compile(r"[^\w\s]|_", re.UNICODE)
 
+# Marcador de temporada no FIM do nome, já sem pontuação e em minúsculas:
+# "4th season", "season 2", "2nd cour", "part 2", "s3", "ii"/"iii".
+# Só no fim, e um por vez, pra "Mushoku Tensei II" não perder o "II" que é
+# parte de como ele nomeia as pastas.
+_SUFIXO_TEMPORADA = re.compile(
+    r"\s+(?:\d+(?:st|nd|rd|th)\s+(?:season|cour)"
+    r"|(?:season|cour|part|parte)\s+\d+"
+    r"|s\d{1,2}"
+    r"|final\s+season)$",
+    re.IGNORECASE,
+)
+
 
 class AnimeFolderStore:
     """Arquivo em `<cache>/pastas_de_anime.json`."""
@@ -100,9 +112,27 @@ class AnimeFolderStore:
         if isinstance(valor, str) and valor:
             return valor
         # Sem a temporada exata, qualquer uma serve: a franquia é a mesma.
+        por_base = {}
         for chave, v in dados.items():
-            if str(chave).split("|")[0] == base and isinstance(v, str) and v:
-                return v
+            if isinstance(v, str) and v:
+                por_base.setdefault(str(chave).split("|")[0], v)
+        if base in por_base:
+            return por_base[base]
+
+        # Marcador de temporada no fim não muda a franquia.
+        #
+        # Os arquivos de fansub trazem isso o tempo todo — "Re Zero kara
+        # Hajimeru Isekai Seikatsu 4th Season" é o mesmo anime que "Re Zero
+        # kara Hajimeru Isekai Seikatsu", que é o que está guardado. Sem
+        # aparar, toda temporada nova chega como anime desconhecido.
+        aparado = base
+        while True:
+            novo = _SUFIXO_TEMPORADA.sub("", aparado).strip()
+            if novo == aparado or not novo:
+                break
+            aparado = novo
+            if aparado in por_base:
+                return por_base[aparado]
         return ""
 
     def decide(

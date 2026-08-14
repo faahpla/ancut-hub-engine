@@ -938,11 +938,22 @@ def _anime_folder(anime: str) -> None:
     cfg = Config.load()
     store = AnimeFolderStore(cfg.cache_dir)
     store.seed_from_history(cfg.cache_dir, cfg.output_dir)
-    lembrada = store.folder_for_name(anime) if anime else None
+
+    # A MESMA decisão que a análise vai tomar, franquia inclusive.
+    #
+    # Antes isto olhava só o apelido, e então a dica mentia exatamente nos
+    # casos que importam: com "Re:Zero ... 4th Season" a tela prometia uma
+    # pasta nova enquanto a análise, que conhece a franquia, mandaria pra
+    # pasta certa. Dica que mente é pior do que dica nenhuma.
+    #
+    # `season=0` de propósito: a franquia é a mesma em qualquer temporada, e
+    # a busca cai no casamento por nome quando não acha a temporada exata.
+    cache_id = store.franchise_for_name(anime, 0, cfg.cache_dir) if anime else ""
+    escolhida = store.decide(typed=anime, franchise_key=cache_id) if anime else ""
     _emit({
         "type": "anime-folder",
-        "folder": lembrada or (sanitize(anime) if anime else ""),
-        "remembered": lembrada is not None,
+        "folder": escolhida,
+        "remembered": bool(anime) and escolhida != sanitize(anime),
         "existing": existing_folders(cfg.output_dir),
     })
 
