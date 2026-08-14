@@ -32,6 +32,8 @@ import json
 import re
 from pathlib import Path
 
+from .organizer import sanitize
+
 # Tudo que não é letra, número ou espaço — mais o sublinhado, que o `\w`
 # deixaria passar.
 _PONTUACAO = re.compile(r"[^\w\s]|_", re.UNICODE)
@@ -74,6 +76,60 @@ class AnimeFolderStore:
             return None
         return self._load()["franquias"].get(str(franchise_key))
 
+    def franchise_for_name(self, typed: str, season: int, cache_root: Path | str) -> str:
+        """Franquia deste nome segundo o cache LOCAL de buscas. Sem rede.
+
+        O `busca_resolvida.json` guarda o que a busca online já respondeu uma
+        vez — exatamente o par que falta aqui: nome digitado → franquia. Ler
+        dele é o que permite os modos offline ("Só cortar") saberem a
+        identidade sem tocar na rede.
+
+        Só serve pra nome que ele já analisou antes. Grafia nova continua sem
+        resposta, e aí não há o que fazer sem consultar a fonte.
+        """
+        atalho = Path(cache_root) / "anime_db" / "busca_resolvida.json"
+        try:
+            dados = json.loads(atalho.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return ""
+        if not isinstance(dados, dict):
+            return ""
+        # Mesma regra de chave do AnimeProvider._atalho_chave.
+        base = re.sub(r"[^a-z0-9]+", " ", (typed or "").lower()).strip()
+        valor = dados.get(f"{base}|s{season}")
+        if isinstance(valor, str) and valor:
+            return valor
+        # Sem a temporada exata, qualquer uma serve: a franquia é a mesma.
+        for chave, v in dados.items():
+            if str(chave).split("|")[0] == base and isinstance(v, str) and v:
+                return v
+        return ""
+
+    def decide(
+        self, *, typed: str, explicit: str = "", franchise_key: str = ""
+    ) -> str:
+        """Em que pasta este episódio vai cair. Um lugar só, pros três modos.
+
+        **A identidade vence o apelido.** Esta ordem já foi ao contrário, e
+        custou caro: o nome digitado era consultado primeiro, então bastava
+        uma análise gravar "Re Zero" como apelido pra que TODA análise
+        seguinte fosse pra lá — inclusive as que sabiam perfeitamente que
+        aquilo era a franquia `al21355`, já com pasta própria. O apelido é
+        como ele chamou o anime num dia; a franquia é o que o anime É.
+
+        A pasta digitada à mão continua acima das duas: é instrução direta
+        dele, não memória minha.
+        """
+        if explicit:
+            return sanitize(explicit)
+        por_franquia = self.folder_for_franchise(franchise_key)
+        if por_franquia:
+            return por_franquia
+        por_nome = self.folder_for_name(typed)
+        if por_nome:
+            return por_nome
+        return sanitize(typed) if typed else "unknown"
+
     def remember(
         self, typed: str, folder: str, franchise_key: str = ""
     ) -> None:
@@ -88,8 +144,43 @@ class AnimeFolderStore:
         data = self._load()
         data["nomes"][_chave(typed)] = folder
         if franchise_key:
-            data["franquias"].setdefault(str(franchise_key), folder)
+            canonica = data["franquias"].setdefault(str(franchise_key), folder)
+            # Apelido que discorda da franquia é apelido velho, de antes de a
+            # identidade ser conhecida. Deixá-lo apontando pro lugar errado
+            # faria ele vencer de novo em toda análise futura — foi assim que
+            # "Re Zero" continuou puxando episódio pra fora da pasta certa
+            # mesmo depois de a franquia estar sabida.
+            if canonica != folder:
+                data["nomes"][_chave(typed)] = canonica
         self._save(data)
+
+    def repoint(self, de: str, para: str) -> int:
+        """Toda memória que apontava pra pasta `de` passa a apontar pra `para`.
+
+        Chamado depois de juntar duas pastas. Sem isto a junção duraria até a
+        próxima análise: o apelido continuaria mandando pra pasta que acabou
+        de sumir, e ela nasceria de novo — dando a impressão de que juntar não
+        funciona.
+
+        Mexe nas duas memórias. A da franquia é sobrescrita de propósito, ao
+        contrário do `remember`: aqui a mudança de pasta é ordem explícita
+        dele, não palpite meu.
+        """
+        if not de or not para or de == para:
+            return 0
+        data = self._load()
+        n = 0
+        for chave, pasta in list(data["nomes"].items()):
+            if pasta == de:
+                data["nomes"][chave] = para
+                n += 1
+        for chave, pasta in list(data["franquias"].items()):
+            if pasta == de:
+                data["franquias"][chave] = para
+                n += 1
+        if n:
+            self._save(data)
+        return n
 
     def forget(self, typed: str) -> None:
         data = self._load()

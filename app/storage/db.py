@@ -257,6 +257,20 @@ class Database:
                 "UPDATE episode SET output_root=? WHERE id=?", (str(root), episode_id)
             )
 
+    def all_episode_roots(self) -> list[dict]:
+        """Todo episódio que tem pasta gravada — `id` e `output_root`.
+
+        Sem `LIMIT` e sem exigir cenas, ao contrário de `recent_episodes`:
+        quem junta pastas precisa reapontar TUDO que morava na origem,
+        inclusive episódio antigo que não cabe no histórico da tela e análise
+        que ficou sem cena. Deixar um pra trás cria caminho quebrado.
+        """
+        with self.connect() as c:
+            rows = c.execute(
+                "SELECT id, output_root FROM episode WHERE output_root IS NOT NULL"
+            ).fetchall()
+            return [dict(r) for r in rows]
+
     def recent_episodes(self, limit: int = 20) -> list[dict]:
         """Episódios analisados, do mais recente pro mais antigo.
 

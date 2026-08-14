@@ -947,6 +947,32 @@ def _anime_folder(anime: str) -> None:
     })
 
 
+def _merge_anime(origem: str, destino: str, aplicar: bool) -> None:
+    """Junta duas pastas de anime numa só.
+
+    Sempre em dois tempos: a tela pede o PLANO, mostra o que vai acontecer, e
+    só então pede a execução. Mover 400 clipes sem o usuário ter visto a lista
+    seria a mesma imprudência que apagar sem perguntar.
+    """
+    from .config import Config
+    from .storage.anime_folders import AnimeFolderStore
+    from .storage.db import Database
+    from .storage.juntar_animes import juntar, planejar
+
+    cfg = Config.load()
+    db = Database(cfg.cache_path / "index.db")
+    plano = (juntar if aplicar else planejar)(cfg.output_dir, origem, destino, db)
+
+    repontadas = 0
+    if aplicar and plano.pode:
+        # Depois dos arquivos: a memória de pastas tem que seguir a mudança,
+        # senão a próxima análise recria a pasta que acabou de sumir.
+        repontadas = AnimeFolderStore(cfg.cache_path).repoint(origem, destino)
+
+    _emit({"type": "merge-anime", "aplicado": bool(aplicar and plano.pode),
+           "repontadas": repontadas, **plano.payload()})
+
+
 def _bench_add(episode_id: int, label: str = "") -> None:
     """Congela este episódio como gabarito do benchmark.
 
@@ -1293,6 +1319,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if mode == "anime-folder":
             _anime_folder(args[1] if len(args) > 1 else "")
+            return 0
+        if mode == "merge-anime":
+            _merge_anime(args[1], args[2], aplicar=(len(args) > 3 and args[3] == "apply"))
             return 0
         if mode == "bench-add":
             _bench_add(int(args[1]), args[2] if len(args) > 2 else "")

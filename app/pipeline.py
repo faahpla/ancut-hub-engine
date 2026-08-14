@@ -180,13 +180,10 @@ class Pipeline:
         cache_id = _cache_id_for(bundle)
         pastas = AnimeFolderStore(cfg.cache_path)
         pastas.seed_from_history(cfg.cache_path, cfg.output_path)
-        pasta_anime = (
-            # `sanitize("")` devolve "unknown", não "" — por isso o teste vem
-            # antes da chamada, e não depois dela.
-            (sanitize(info.output_folder) if info.output_folder else "")
-            or pastas.folder_for_name(info.anime)
-            or pastas.folder_for_franchise(cache_id)
-            or sanitize(info.anime)
+        pasta_anime = pastas.decide(
+            typed=info.anime,
+            explicit=info.output_folder,
+            franchise_key=cache_id,
         )
         if pasta_anime != sanitize(info.anime):
             print(
@@ -1508,18 +1505,21 @@ class Pipeline:
         cfg = self.cfg
 
         cb("parse", 1.0, f"{info.anime} {info.slug}")
-        # Só a memória local de pastas: consultar a franquia exigiria rede, e
-        # "sem internet" é metade da razão deste modo existir.
+        # A franquia SEM rede: o `busca_resolvida.json` já guarda nome →
+        # franquia de tudo que ele analisou antes. Este modo ficou cego pra
+        # identidade por muito tempo, e era ele quem plantava o apelido que
+        # depois vencia as análises normais.
         pastas = AnimeFolderStore(cfg.cache_path)
-        pasta_anime = (
-            (sanitize(info.output_folder) if info.output_folder else "")
-            or pastas.folder_for_name(info.anime)
-            or sanitize(info.anime)
+        cache_id = pastas.franchise_for_name(info.anime, info.season, cfg.cache_path)
+        pasta_anime = pastas.decide(
+            typed=info.anime,
+            explicit=info.output_folder,
+            franchise_key=cache_id,
         )
         episode_root, metadata_dir, cut_results = self._prepare_shots(
             info, cb, pasta_anime
         )
-        pastas.remember(info.anime, pasta_anime)
+        pastas.remember(info.anime, pasta_anime, cache_id)
 
         anime_id = self.db.upsert_anime(anilist_id=None, title=info.anime)
         episode_id = self.db.upsert_episode(
@@ -1587,18 +1587,23 @@ class Pipeline:
         cb = timer.wrap(on_progress or _noop)
         cfg = self.cfg
         cb("parse", 1.0, f"{info.anime} {info.slug}")
-        # Na Descoberta a identidade online é opcional, então aqui só vale a
-        # memória que NÃO depende de rede: a pasta já combinada pra este nome.
+        # Na Descoberta a identidade online é opcional, então aqui vale o que
+        # NÃO depende de rede: a franquia que o cache de buscas já conhece e a
+        # pasta combinada pra este nome. Se o anime resolver mais adiante, a
+        # franquia de verdade é gravada lá embaixo.
         pastas = AnimeFolderStore(cfg.cache_path)
-        pasta_anime = (
-            (sanitize(info.output_folder) if info.output_folder else "")
-            or pastas.folder_for_name(info.anime)
-            or sanitize(info.anime)
+        cache_id_local = pastas.franchise_for_name(
+            info.anime, info.season, cfg.cache_path
+        )
+        pasta_anime = pastas.decide(
+            typed=info.anime,
+            explicit=info.output_folder,
+            franchise_key=cache_id_local,
         )
         episode_root, metadata_dir, cut_results = self._prepare_shots(
             info, cb, pasta_anime
         )
-        pastas.remember(info.anime, pasta_anime)
+        pastas.remember(info.anime, pasta_anime, cache_id_local)
 
         # Identidade online é opcional na descoberta: se o anime resolver,
         # os grupos reforçam o banco REAL (refs em al<root>) e os nomes são
@@ -1640,6 +1645,10 @@ class Pipeline:
                 disc_cache_id = f"al{online_bundle.anilist_id}"
             else:
                 disc_cache_id = f"mal{online_bundle.mal_id}"
+            # A identidade só ficou conhecida AGORA — a pasta já foi escolhida
+            # lá em cima, sem ela. Gravar aqui é o que faz a próxima análise
+            # deste anime achar a pasta, mesmo que ele digite outro nome.
+            pastas.remember(info.anime, pasta_anime, disc_cache_id)
             for row in self.db.get_characters_for_anime(anime_id):
                 if row.get("embedding"):
                     known_centroids.append((row["name"], from_bytes(row["embedding"])))
