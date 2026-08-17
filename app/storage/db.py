@@ -257,6 +257,37 @@ class Database:
                 "UPDATE episode SET output_root=? WHERE id=?", (str(root), episode_id)
             )
 
+    def episodes_by_ids(self, ids: list[int]) -> list[dict]:
+        """Linhas completas de episódio, por id. Usada por quem renomeia."""
+        if not ids:
+            return []
+        marcas = ",".join("?" * len(ids))
+        with self.connect() as c:
+            rows = c.execute(
+                f"SELECT id, anime_id, season, episode, kind, output_root "
+                f"FROM episode WHERE id IN ({marcas})",
+                tuple(ids),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def episode_at(self, anime_id: int, season: int, episode: int, kind: str = "") -> int | None:
+        """Id do episódio nessa posição, se existir.
+
+        A chave (anime, temporada, episódio, tipo) é única — é ela que o resto
+        do app usa pra decidir "é o mesmo episódio". Quem move episódio de
+        temporada tem que checar antes, senão cria duas linhas colidindo.
+        """
+        with self.connect() as c:
+            row = c.execute(
+                "SELECT id FROM episode WHERE anime_id=? AND season=? AND episode=? AND kind=?",
+                (anime_id, season, episode, kind),
+            ).fetchone()
+            return int(row["id"]) if row else None
+
+    def set_episode_season(self, episode_id: int, season: int) -> None:
+        with self.connect() as c:
+            c.execute("UPDATE episode SET season=? WHERE id=?", (season, episode_id))
+
     def all_episode_roots(self) -> list[dict]:
         """Todo episódio que tem pasta gravada — `id` e `output_root`.
 
@@ -271,24 +302,34 @@ class Database:
             ).fetchall()
             return [dict(r) for r in rows]
 
-    def recent_episodes(self, limit: int = 20) -> list[dict]:
+    def recent_episodes(self, limit: int = 0) -> list[dict]:
         """Episódios analisados, do mais recente pro mais antigo.
+
+        **`limit=0` (o padrão) traz TODOS.** O corte existia quando isto
+        alimentava uma lista de "recentes"; hoje alimenta a Biblioteca, que é
+        o acervo inteiro em árvore. Com um limite, cada análise nova empurrava
+        a mais antiga pra fora e o episódio simplesmente desaparecia da tela,
+        intacto no disco e no banco. O usuário via isso como perda de dado, e
+        não havia mensagem nenhuma explicando.
 
         Só os que têm `output_root` gravado e ao menos um shot — sem isso a
         lista ofereceria entradas que não abrem (análises anteriores a esta
         coluna, ou runs que morreram no meio).
         """
+        sql = (
+            "SELECT e.id, e.season, e.episode, e.kind, e.output_root, e.processed_at, "
+            "       a.title AS anime_title, "
+            "       (SELECT COUNT(*) FROM shot s WHERE s.episode_id = e.id) AS shot_count "
+            "FROM episode e JOIN anime a ON a.id = e.anime_id "
+            "WHERE e.output_root IS NOT NULL "
+            "  AND EXISTS (SELECT 1 FROM shot s WHERE s.episode_id = e.id) "
+            "ORDER BY e.processed_at DESC"
+        )
         with self.connect() as c:
-            rows = c.execute(
-                "SELECT e.id, e.season, e.episode, e.kind, e.output_root, e.processed_at, "
-                "       a.title AS anime_title, "
-                "       (SELECT COUNT(*) FROM shot s WHERE s.episode_id = e.id) AS shot_count "
-                "FROM episode e JOIN anime a ON a.id = e.anime_id "
-                "WHERE e.output_root IS NOT NULL "
-                "  AND EXISTS (SELECT 1 FROM shot s WHERE s.episode_id = e.id) "
-                "ORDER BY e.processed_at DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
+            if limit and limit > 0:
+                rows = c.execute(sql + " LIMIT ?", (limit,)).fetchall()
+            else:
+                rows = c.execute(sql).fetchall()
             return [dict(r) for r in rows]
 
     def clear_episode_shots(self, episode_id: int) -> None:

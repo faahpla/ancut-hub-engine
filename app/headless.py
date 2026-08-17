@@ -405,10 +405,19 @@ def _recent() -> None:
         pass  # backfill é oportunista: falhar aqui não pode derrubar a lista
 
     episodes = []
-    for e in db.recent_episodes(30):
+    # Sem limite: isto alimenta a Biblioteca, que é o acervo inteiro. Com o
+    # corte de 30 que havia aqui, cada análise nova empurrava a mais antiga
+    # pra fora e o episódio desaparecia da tela — intacto no disco e no banco,
+    # e sem uma linha explicando. Ele tinha 41 e via 30.
+    sumidas = 0
+    for e in db.recent_episodes():
         root = Path(e["output_root"])
         if not root.is_dir():
-            continue  # pasta apagada por fora: não oferece o que não abre
+            # Pasta apagada por fora: não oferece o que não abre. Mas CONTA,
+            # pra a tela poder dizer que existem — desaparecer calado é o que
+            # faz isto parecer perda de dado.
+            sumidas += 1
+            continue
         episodes.append(
             {
                 "episodeId": e["id"],
@@ -421,7 +430,7 @@ def _recent() -> None:
                 "processedAt": e["processed_at"],
             }
         )
-    _emit({"type": "recent", "episodes": episodes})
+    _emit({"type": "recent", "episodes": episodes, "missingFolders": sumidas})
 
 
 def _cut_export_mode(episode_root: str | None) -> str:
@@ -1000,6 +1009,27 @@ def _anime_folder(anime: str) -> None:
     })
 
 
+def _set_season(episode_ids: list[int], season: int, aplicar_agora: bool) -> None:
+    """Muda a temporada de um ou vários episódios.
+
+    Em dois tempos, como a junção: a tela pede o plano, mostra o que vai
+    virar o que, e só então manda aplicar. Aqui isso importa mais ainda —
+    renomear pasta de episódio é irreversível pelo app.
+    """
+    from .config import Config
+    from .storage.db import Database
+    from .storage.temporadas import aplicar, planejar
+
+    cfg = Config.load()
+    db = Database(cfg.cache_path / "index.db")
+    plano = (aplicar if aplicar_agora else planejar)(episode_ids, season, db)
+    _emit({
+        "type": "set-season",
+        "aplicado": bool(aplicar_agora and plano.pode),
+        **plano.payload(),
+    })
+
+
 def _merge_anime(origem: str, destino: str, aplicar: bool) -> None:
     """Junta duas pastas de anime numa só.
 
@@ -1372,6 +1402,14 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if mode == "anime-folder":
             _anime_folder(args[1] if len(args) > 1 else "")
+            return 0
+        if mode == "set-season":
+            # set-season <temporada> <id,id,...> [apply]
+            _set_season(
+                [int(x) for x in args[2].split(",") if x.strip()],
+                int(args[1]),
+                aplicar_agora=(len(args) > 3 and args[3] == "apply"),
+            )
             return 0
         if mode == "merge-anime":
             _merge_anime(args[1], args[2], aplicar=(len(args) > 3 and args[3] == "apply"))
