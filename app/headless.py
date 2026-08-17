@@ -1010,19 +1010,23 @@ def _anime_folder(anime: str) -> None:
 
 
 def _delete_episode(episode_id: int, aplicar_agora: bool) -> None:
-    """Tira um episódio do histórico. A PASTA não é apagada aqui.
+    """Apaga um episódio: a pasta do disco e a entrada do histórico.
 
-    A divisão é de propósito: quem apaga a pasta é o Electron, com
-    `shell.trashItem` — vai pra Lixeira do Windows, de onde ele consegue
-    restaurar. `shutil.rmtree` daqui destruiria 2 GB de clipes sem volta, e
-    "excluir" na Biblioteca não deveria ser mais destrutivo que excluir uma
-    cena (que já vai pra `_lixeira`).
+    **Apaga DE VEZ, sem lixeira** — decisão do FAAH, com o tamanho na frente.
+    A primeira versão mandava pra Lixeira do Windows; ele preferiu direto.
 
     Sem `apply`, só informa: o que é, quanto pesa e se a pasta está DENTRO da
-    saída configurada. Esse último ponto é a trava: uma linha com caminho
-    estranho (banco velho, saída trocada) não autoriza o app a mandar pasta
-    nenhuma pra lixeira.
+    saída configurada. Esse último ponto é a trava, e sem lixeira ela deixou de
+    ser precaução e virou a única rede: uma linha com caminho estranho (banco
+    velho, saída trocada) não autoriza apagar pasta nenhuma.
+
+    Ordem no `apply`: a pasta primeiro, o banco depois. Se a remoção falhar
+    (arquivo aberto no player, permissão), o histórico fica intacto e o
+    episódio continua abrindo — melhor do que perder a entrada e sobrar uma
+    pasta que ninguém sabe que existe.
     """
+    import shutil
+
     from .config import Config
     from .storage.db import Database
 
@@ -1053,23 +1057,44 @@ def _delete_episode(episode_id: int, aplicar_agora: bool) -> None:
             except OSError:
                 pass
 
-    if aplicar_agora:
-        # Só o banco. A pasta é problema do host, e ele só chama isto DEPOIS
-        # de a lixeira aceitar — assim nunca sobra linha sem pasta nem pasta
-        # sem linha.
+    erro = ""
+    if raiz.name and not dentro:
+        erro = "a pasta do episódio está fora da pasta de saída configurada"
+
+    apagou = False
+    if aplicar_agora and not erro:
+        if raiz.is_dir():
+            try:
+                shutil.rmtree(raiz)
+                apagou = True
+            except OSError as e:
+                # Não encosta no banco: com a pasta ainda lá, o episódio
+                # continua abrindo e ele pode tentar de novo.
+                _emit({
+                    "type": "delete-episode",
+                    "aplicado": False,
+                    "episodeId": episode_id,
+                    "root": str(raiz),
+                    "rootExists": True,
+                    "insideOutput": dentro,
+                    "shots": cenas,
+                    "bytes": bytes_,
+                    "erro": f"não consegui apagar a pasta: {e}",
+                })
+                return
         db.delete_episode(episode_id)
 
     _emit({
         "type": "delete-episode",
-        "aplicado": bool(aplicar_agora),
+        "aplicado": bool(aplicar_agora and not erro),
         "episodeId": episode_id,
         "root": str(raiz),
         "rootExists": raiz.is_dir(),
         "insideOutput": dentro,
         "shots": cenas,
         "bytes": bytes_,
-        "erro": "" if dentro or not raiz.name else
-                "a pasta do episódio está fora da pasta de saída configurada",
+        "folderDeleted": apagou,
+        "erro": erro,
     })
 
 
