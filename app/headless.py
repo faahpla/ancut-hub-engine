@@ -1009,6 +1009,70 @@ def _anime_folder(anime: str) -> None:
     })
 
 
+def _delete_episode(episode_id: int, aplicar_agora: bool) -> None:
+    """Tira um episódio do histórico. A PASTA não é apagada aqui.
+
+    A divisão é de propósito: quem apaga a pasta é o Electron, com
+    `shell.trashItem` — vai pra Lixeira do Windows, de onde ele consegue
+    restaurar. `shutil.rmtree` daqui destruiria 2 GB de clipes sem volta, e
+    "excluir" na Biblioteca não deveria ser mais destrutivo que excluir uma
+    cena (que já vai pra `_lixeira`).
+
+    Sem `apply`, só informa: o que é, quanto pesa e se a pasta está DENTRO da
+    saída configurada. Esse último ponto é a trava: uma linha com caminho
+    estranho (banco velho, saída trocada) não autoriza o app a mandar pasta
+    nenhuma pra lixeira.
+    """
+    from .config import Config
+    from .storage.db import Database
+
+    cfg = Config.load()
+    db = Database(cfg.cache_path / "index.db")
+    linhas = db.episodes_by_ids([episode_id])
+    if not linhas:
+        _emit({"type": "delete-episode", "erro": f"episódio {episode_id} não existe"})
+        return
+    r = linhas[0]
+    raiz = Path(r["output_root"] or "")
+    saida = Path(cfg.output_dir).resolve()
+
+    dentro = False
+    if raiz.name:
+        try:
+            dentro = raiz.resolve().is_relative_to(saida)
+        except (OSError, ValueError):
+            dentro = False
+
+    cenas = len(db.shots_for_episode(episode_id))
+    bytes_ = 0
+    if raiz.is_dir():
+        for f in raiz.rglob("*"):
+            try:
+                if f.is_file():
+                    bytes_ += f.stat().st_size
+            except OSError:
+                pass
+
+    if aplicar_agora:
+        # Só o banco. A pasta é problema do host, e ele só chama isto DEPOIS
+        # de a lixeira aceitar — assim nunca sobra linha sem pasta nem pasta
+        # sem linha.
+        db.delete_episode(episode_id)
+
+    _emit({
+        "type": "delete-episode",
+        "aplicado": bool(aplicar_agora),
+        "episodeId": episode_id,
+        "root": str(raiz),
+        "rootExists": raiz.is_dir(),
+        "insideOutput": dentro,
+        "shots": cenas,
+        "bytes": bytes_,
+        "erro": "" if dentro or not raiz.name else
+                "a pasta do episódio está fora da pasta de saída configurada",
+    })
+
+
 def _set_season(episode_ids: list[int], season: int, aplicar_agora: bool) -> None:
     """Muda a temporada de um ou vários episódios.
 
@@ -1402,6 +1466,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if mode == "anime-folder":
             _anime_folder(args[1] if len(args) > 1 else "")
+            return 0
+        if mode == "delete-episode":
+            _delete_episode(int(args[1]), aplicar_agora=(len(args) > 2 and args[2] == "apply"))
             return 0
         if mode == "set-season":
             # set-season <temporada> <id,id,...> [apply]

@@ -284,6 +284,28 @@ class Database:
             ).fetchone()
             return int(row["id"]) if row else None
 
+    def delete_episode(self, episode_id: int) -> None:
+        """Apaga o episódio e tudo que pende dele, numa transação só.
+
+        Ordem de dentro pra fora, senão as chaves estrangeiras (ou, sem elas,
+        as linhas órfãs) sobram apontando pro nada. `manual_override` vai junto
+        de propósito: a curadoria era daquele episódio e não faz sentido
+        sobreviver a ele — pior, reapareceria se o mesmo episódio fosse
+        analisado de novo.
+        """
+        with self.connect() as c:
+            c.execute(
+                "DELETE FROM shot_character WHERE shot_id IN "
+                "(SELECT id FROM shot WHERE episode_id=?)",
+                (episode_id,),
+            )
+            c.execute("DELETE FROM shot WHERE episode_id=?", (episode_id,))
+            try:
+                c.execute("DELETE FROM manual_override WHERE episode_id=?", (episode_id,))
+            except sqlite3.OperationalError:
+                pass  # banco anterior a esta tabela
+            c.execute("DELETE FROM episode WHERE id=?", (episode_id,))
+
     def set_episode_season(self, episode_id: int, season: int) -> None:
         with self.connect() as c:
             c.execute("UPDATE episode SET season=? WHERE id=?", (season, episode_id))
