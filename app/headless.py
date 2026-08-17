@@ -424,6 +424,23 @@ def _recent() -> None:
     _emit({"type": "recent", "episodes": episodes})
 
 
+def _cut_export_mode(episode_root: str | None) -> str:
+    """Modo de export gravado ao lado dos clipes. "off" quando não há marca.
+
+    Sem marcador é análise antiga, anterior à opção — e aí "off" é a suposição
+    correta, a mesma que o cortador faz.
+    """
+    if not episode_root:
+        return "off"
+    try:
+        marca = (Path(episode_root) / "shots" / ".export_mode").read_text(
+            encoding="utf-8"
+        ).strip()
+    except OSError:
+        return "off"
+    return marca if marca in ("off", "compat", "intra") else "off"
+
+
 def _results(episode_id: int) -> None:
     """Personagens do episódio, com a contagem de cenas de cada um."""
     from .config import Config
@@ -441,6 +458,7 @@ def _results(episode_id: int) -> None:
     with db.connect() as c:
         ep = c.execute(
             "SELECT e.id, e.season, e.episode, e.kind, e.output_root, e.anime_id, "
+            "       e.source_file, "
             "       a.title AS anime_title, a.anilist_id, a.mal_id "
             "FROM episode e JOIN anime a ON a.id = e.anime_id WHERE e.id=?",
             (episode_id,),
@@ -471,6 +489,30 @@ def _results(episode_id: int) -> None:
             "totalShots": len(db.shots_for_episode(episode_id)),
             "characters": characters,
             "refsDir": _refs_dir_for(cfg, ep["anilist_id"], ep["mal_id"]),
+            # Pro "identificar depois": a tela precisa do vídeo de origem e da
+            # pasta EXATA em que o episódio já mora.
+            #
+            # A pasta vai explícita de propósito. Decidir de novo poderia
+            # escolher outra (a memória de pastas mudou desde então) e o
+            # episódio seria recortado num lugar novo, deixando o antigo pra
+            # trás — reidentificar não é hora de reorganizar nada.
+            "sourceFile": ep["source_file"] or "",
+            "sourceExists": bool(
+                ep["source_file"] and Path(ep["source_file"]).is_file()
+            ),
+            "animeFolder": (
+                Path(ep["output_root"]).parent.name if ep["output_root"] else ""
+            ),
+            # O formato em que os clipes FORAM cortados, lido do marcador que
+            # o cortador deixa ao lado deles.
+            #
+            # Isto é o que faz "identificar depois" ser rápido. O cortador
+            # recorta TUDO quando o modo de export muda — e com razão, senão
+            # ligar a opção não mudaria nada. Mas se a reidentificação mandasse
+            # o modo que está na tela em vez do modo do disco, ela recortaria
+            # os 360 clipes de novo e demoraria igual à análise inteira, sem
+            # ninguém entender por quê.
+            "cutExportMode": _cut_export_mode(ep["output_root"]),
         }
     )
 
