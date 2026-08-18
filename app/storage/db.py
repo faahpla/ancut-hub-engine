@@ -257,6 +257,89 @@ class Database:
                 "UPDATE episode SET output_root=? WHERE id=?", (str(root), episode_id)
             )
 
+    def characters_with_shots(self) -> list[dict]:
+        """Personagens que têm ao menos uma cena, do mais presente pro menos.
+
+        A ordem importa pra quem agrupa grafias: processando do maior pro
+        menor, o nome que o usuário mais vê é o que vira o nome do grupo.
+        `sample` é um keyframe qualquer dele, pra a lista ter rosto.
+        """
+        with self.connect() as c:
+            rows = c.execute(
+                "SELECT ch.id, ch.name, ch.anime_id, "
+                "       COUNT(DISTINCT sc.shot_id) AS n, "
+                # As duas metades do caminho vêm SEPARADAS de propósito.
+                #
+                # Concatenar aqui custou caro: a barra escrita numa string
+                # Python de aspas duplas colapsou pra duas aspas simples,
+                # que em SQL é a string VAZIA — a amostra saía
+                # "Tensura\S03E10keyframes8_1.jpg", sem separador, e
+                # 95 das 97 miniaturas não abriam. Juntar caminho é
+                # trabalho do pathlib, não do banco.
+                "       (SELECT s2.output_root FROM shot s "
+                "          JOIN shot_character x ON x.shot_id = s.id "
+                "          JOIN episode s2 ON s2.id = s.episode_id "
+                "         WHERE x.character_id = ch.id AND s.keyframe IS NOT NULL "
+                "           AND s2.output_root IS NOT NULL "
+                "         ORDER BY x.confidence DESC LIMIT 1) AS sample_root, "
+                "       (SELECT s.keyframe FROM shot s "
+                "          JOIN shot_character x ON x.shot_id = s.id "
+                "          JOIN episode s2 ON s2.id = s.episode_id "
+                "         WHERE x.character_id = ch.id AND s.keyframe IS NOT NULL "
+                "           AND s2.output_root IS NOT NULL "
+                "         ORDER BY x.confidence DESC LIMIT 1) AS sample_kf "
+                "FROM character ch "
+                "JOIN shot_character sc ON sc.character_id = ch.id "
+                "GROUP BY ch.id ORDER BY n DESC, ch.name"
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def shot_stats_for_characters(self, ids: list[int]) -> tuple[int, int, list[str]]:
+        """(cenas distintas, episódios distintos, pastas de episódio).
+
+        DISTINCT no shot_id porque duas grafias do mesmo personagem podem
+        estar ligadas à MESMA cena — somar por linha contaria duas vezes.
+        """
+        if not ids:
+            return 0, 0, []
+        marcas = ",".join("?" * len(ids))
+        with self.connect() as c:
+            row = c.execute(
+                f"SELECT COUNT(DISTINCT s.id) AS cenas, "
+                f"       COUNT(DISTINCT s.episode_id) AS eps "
+                f"  FROM shot_character sc JOIN shot s ON s.id = sc.shot_id "
+                f" WHERE sc.character_id IN ({marcas})",
+                tuple(ids),
+            ).fetchone()
+            raizes = c.execute(
+                f"SELECT DISTINCT e.output_root FROM shot_character sc "
+                f"  JOIN shot s ON s.id = sc.shot_id "
+                f"  JOIN episode e ON e.id = s.episode_id "
+                f" WHERE sc.character_id IN ({marcas}) AND e.output_root IS NOT NULL",
+                tuple(ids),
+            ).fetchall()
+            return int(row["cenas"]), int(row["eps"]), [r[0] for r in raizes]
+
+    def shots_for_characters(self, ids: list[int]) -> list[dict]:
+        """Cenas desses personagens no acervo inteiro, com o episódio junto."""
+        if not ids:
+            return []
+        marcas = ",".join("?" * len(ids))
+        with self.connect() as c:
+            rows = c.execute(
+                f"SELECT DISTINCT s.id, s.idx, s.file, s.keyframe, s.duration, "
+                f"       s.episode_id, e.output_root, e.season, e.episode, e.kind, "
+                f"       MAX(sc.confidence) AS confidence "
+                f"  FROM shot_character sc "
+                f"  JOIN shot s ON s.id = sc.shot_id "
+                f"  JOIN episode e ON e.id = s.episode_id "
+                f" WHERE sc.character_id IN ({marcas}) "
+                f" GROUP BY s.id "
+                f" ORDER BY e.season, e.episode, s.idx",
+                tuple(ids),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
     def episodes_by_ids(self, ids: list[int]) -> list[dict]:
         """Linhas completas de episódio, por id. Usada por quem renomeia."""
         if not ids:

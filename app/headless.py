@@ -1009,6 +1009,43 @@ def _anime_folder(anime: str) -> None:
     })
 
 
+def _characters(termo: str = "") -> None:
+    """Todos os personagens do acervo, com quantas cenas cada um tem.
+
+    A Biblioteca organiza por anime; isto atravessa o acervo inteiro. Devolve
+    `outputDir` junto porque os caminhos vêm relativos a ela — a grade de um
+    personagem mistura episódios de vários animes, e um prefixo `media://` por
+    episódio não daria conta.
+    """
+    from .config import Config
+    from .storage.db import Database
+    from .storage.personagens import listar
+
+    cfg = Config.load()
+    db = Database(cfg.cache_path / "index.db")
+    grupos = listar(db, cfg.output_dir, termo)
+    _emit({
+        "type": "characters",
+        "outputDir": str(cfg.output_dir),
+        "characters": [g.payload() for g in grupos],
+    })
+
+
+def _character_shots(ids: list[int]) -> None:
+    """Todas as cenas desses personagens, no acervo inteiro."""
+    from .config import Config
+    from .storage.db import Database
+    from .storage.personagens import cenas_de
+
+    cfg = Config.load()
+    db = Database(cfg.cache_path / "index.db")
+    _emit({
+        "type": "character-shots",
+        "outputDir": str(cfg.output_dir),
+        "shots": cenas_de(db, cfg.output_dir, ids),
+    })
+
+
 def _delete_episode(episode_id: int, aplicar_agora: bool) -> None:
     """Apaga um episódio: a pasta do disco e a entrada do histórico.
 
@@ -1491,6 +1528,12 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if mode == "anime-folder":
             _anime_folder(args[1] if len(args) > 1 else "")
+            return 0
+        if mode == "characters":
+            _characters(args[1] if len(args) > 1 else "")
+            return 0
+        if mode == "character-shots":
+            _character_shots([int(x) for x in args[1].split(",") if x.strip()])
             return 0
         if mode == "delete-episode":
             _delete_episode(int(args[1]), aplicar_agora=(len(args) > 2 and args[2] == "apply"))
