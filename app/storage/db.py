@@ -560,7 +560,14 @@ class Database:
         if episode_id is not None:
             query += " AND s.episode_id = ?"
             args.append(episode_id)
-        query += " ORDER BY sc.confidence DESC"
+        # ORDEM DA CENA, não confiança.
+        #
+        # Isto ordenava por `sc.confidence DESC`, e a grade de um personagem
+        # saía embaralhada: #0360 antes de #0236. Pra quem edita, a ordem que
+        # importa é a do episódio — cenas vizinhas são vizinhas na história, e
+        # é assim que se acha o corte que ficou partido no meio. A confiança
+        # continua visível no selo de cada card, que é onde ela serve.
+        query += " ORDER BY s.idx"
         with self.connect() as c:
             rows = c.execute(query, args).fetchall()
             return [dict(r) for r in rows]
