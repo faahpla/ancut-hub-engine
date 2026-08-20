@@ -72,6 +72,26 @@ CREATE INDEX IF NOT EXISTS idx_shot_char_shot ON shot_character(shot_id);
 CREATE INDEX IF NOT EXISTS idx_shot_char_char ON shot_character(character_id);
 CREATE INDEX IF NOT EXISTS idx_character_anime ON character(anime_id);
 
+-- Clipes favoritados pelo usuário.
+--
+-- A chave inclui o PERSONAGEM porque o favorito é sempre "esta cena, deste
+-- personagem": é assim que a Biblioteca monta "Favoritos → Mushoku Tensei →
+-- Rudeus". A mesma cena pode ser favorita de dois personagens que aparecem
+-- nela, e isso é uma resposta certa, não uma duplicata.
+--
+-- `character_id = 0` é o favorito feito na visão "Todas as cenas", onde não
+-- há personagem em contexto. Zero em vez de NULL porque no SQLite dois NULLs
+-- são distintos — a chave primária deixaria favoritar a mesma cena infinitas
+-- vezes.
+CREATE TABLE IF NOT EXISTS favorite (
+    shot_id INTEGER NOT NULL REFERENCES shot(id) ON DELETE CASCADE,
+    character_id INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (shot_id, character_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_favorite_shot ON favorite(shot_id);
+
 -- Curadoria manual do usuário (remover/mover/aprovar na aba Resultados).
 -- Presa ao NÚMERO da cena (shot_idx), não ao id da linha: a reanálise apaga
 -- e recria os shots, mas os números são estáveis (cache de detecção), então
@@ -256,6 +276,65 @@ class Database:
             c.execute(
                 "UPDATE episode SET output_root=? WHERE id=?", (str(root), episode_id)
             )
+
+    def toggle_favorite(self, shot_id: int, character_id: int = 0) -> bool:
+        """Liga/desliga o favorito. Devolve o estado NOVO.
+
+        Devolver o estado em vez de void é o que deixa a tela acertar a
+        estrela sem ter que perguntar de novo.
+        """
+        with self.connect() as c:
+            achou = c.execute(
+                "SELECT 1 FROM favorite WHERE shot_id=? AND character_id=?",
+                (shot_id, character_id),
+            ).fetchone()
+            if achou:
+                c.execute(
+                    "DELETE FROM favorite WHERE shot_id=? AND character_id=?",
+                    (shot_id, character_id),
+                )
+                return False
+            c.execute(
+                "INSERT INTO favorite(shot_id, character_id) VALUES(?,?)",
+                (shot_id, character_id),
+            )
+            return True
+
+    def favorite_shot_ids(self, character_id: int | None = None) -> set[int]:
+        """Ids das cenas favoritas — de um personagem, ou de todos."""
+        with self.connect() as c:
+            if character_id is None:
+                rows = c.execute("SELECT DISTINCT shot_id FROM favorite").fetchall()
+            else:
+                rows = c.execute(
+                    "SELECT shot_id FROM favorite WHERE character_id=?",
+                    (character_id,),
+                ).fetchall()
+            return {int(r[0]) for r in rows}
+
+    def favorites(self) -> list[dict]:
+        """Todo favorito, com a cena, o episódio e o personagem juntos.
+
+        Um JOIN só: a Biblioteca precisa de tudo isso pra agrupar por anime e
+        por personagem, e ir buscar peça por peça seria N+1 consultas.
+        """
+        with self.connect() as c:
+            rows = c.execute(
+                "SELECT f.shot_id, f.character_id, f.created_at, "
+                "       s.idx, s.file, s.keyframe, s.duration, s.episode_id, "
+                "       e.output_root, e.season, e.episode, e.kind, "
+                "       ch.name AS character_name, "
+                "       (SELECT sc.confidence FROM shot_character sc "
+                "         WHERE sc.shot_id = s.id AND sc.character_id = f.character_id) "
+                "         AS confidence "
+                "  FROM favorite f "
+                "  JOIN shot s ON s.id = f.shot_id "
+                "  JOIN episode e ON e.id = s.episode_id "
+                "  LEFT JOIN character ch ON ch.id = f.character_id "
+                " WHERE e.output_root IS NOT NULL "
+                " ORDER BY e.season, e.episode, s.idx"
+            ).fetchall()
+            return [dict(r) for r in rows]
 
     def characters_with_shots(self) -> list[dict]:
         """Personagens que têm ao menos uma cena, do mais presente pro menos.

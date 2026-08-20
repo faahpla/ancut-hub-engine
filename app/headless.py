@@ -588,6 +588,12 @@ def _shots(episode_id: int, character_id: int) -> None:
         ]
     else:
         rows = db.shots_for_character(character_id, episode_id=episode_id)
+
+    # Marca quais já são favoritas NESTE contexto (o personagem aberto, ou 0
+    # na visão de todas). Sem isto a estrela nasceria vazia em cena que já é
+    # favorita, e o clique seguinte desfavoritaria sem querer.
+    favoritas = db.favorite_shot_ids(max(character_id, 0))
+    rows = [{**r, "favorite": r["id"] in favoritas} for r in rows]
     _emit(
         {
             "type": "shots",
@@ -602,6 +608,7 @@ def _shots(episode_id: int, character_id: int) -> None:
                     "duration": r["duration"],
                     "confidence": r["confidence"],
                     "approved": r["approved"],
+                    "favorite": r["favorite"],
                 }
                 for r in rows
             ],
@@ -1009,6 +1016,40 @@ def _anime_folder(anime: str) -> None:
     })
 
 
+def _fav_toggle(shot_id: int, character_id: int = 0) -> None:
+    """Liga/desliga o favorito e devolve o estado NOVO.
+
+    Devolver o estado (e não só "ok") é o que deixa a tela acertar a estrela
+    sem uma segunda ida ao motor.
+    """
+    from .config import Config
+    from .storage.db import Database
+
+    cfg = Config.load()
+    db = Database(cfg.cache_path / "index.db")
+    _emit({
+        "type": "fav-toggle",
+        "shotId": shot_id,
+        "characterId": character_id,
+        "favorite": db.toggle_favorite(shot_id, character_id),
+    })
+
+
+def _favorites() -> None:
+    """Favoritos do acervo, em anime → personagem → cenas."""
+    from .config import Config
+    from .storage.db import Database
+    from .storage.favoritos import listar
+
+    cfg = Config.load()
+    db = Database(cfg.cache_path / "index.db")
+    _emit({
+        "type": "favorites",
+        "outputDir": str(cfg.output_dir),
+        "animes": [a.payload() for a in listar(db, cfg.output_dir)],
+    })
+
+
 def _characters(termo: str = "") -> None:
     """Todos os personagens do acervo, com quantas cenas cada um tem.
 
@@ -1039,10 +1080,16 @@ def _character_shots(ids: list[int]) -> None:
 
     cfg = Config.load()
     db = Database(cfg.cache_path / "index.db")
+    cenas = cenas_de(db, cfg.output_dir, ids)
+    # Aqui o contexto são VÁRIAS linhas do mesmo personagem (as grafias
+    # unidas), então a cena é favorita se qualquer uma delas a marcou.
+    favoritas: set[int] = set()
+    for cid in ids:
+        favoritas |= db.favorite_shot_ids(cid)
     _emit({
         "type": "character-shots",
         "outputDir": str(cfg.output_dir),
-        "shots": cenas_de(db, cfg.output_dir, ids),
+        "shots": [{**c, "favorite": c["id"] in favoritas} for c in cenas],
     })
 
 
@@ -1528,6 +1575,12 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if mode == "anime-folder":
             _anime_folder(args[1] if len(args) > 1 else "")
+            return 0
+        if mode == "fav-toggle":
+            _fav_toggle(int(args[1]), int(args[2]) if len(args) > 2 else 0)
+            return 0
+        if mode == "favorites":
+            _favorites()
             return 0
         if mode == "characters":
             _characters(args[1] if len(args) > 1 else "")
