@@ -31,9 +31,15 @@ class GrupoFavorito:
 
     personagem: str
     cenas: list[dict] = field(default_factory=list)
+    # As linhas de `character` que caíram neste grupo. Vão pra tela porque
+    # NOME NÃO É CHAVE: aqui o grupo se chama "Rudeus" (o nome da primeira
+    # cena) e no índice de personagens ele é "Greyrat, Rudeus". Casar os dois
+    # por texto falha em silêncio — a tela some com a opção de corrigir e
+    # ninguém entende por quê. Com o id, não há o que casar.
+    ids: list[int] = field(default_factory=list)
 
     def payload(self) -> dict:
-        return {"character": self.personagem, "shots": self.cenas}
+        return {"character": self.personagem, "characterIds": self.ids, "shots": self.cenas}
 
 
 @dataclass
@@ -100,8 +106,8 @@ def listar(db: Database, output_dir: Path | str) -> list[AnimeFavorito]:
             "favoritedAt": r["created_at"],
         }
 
-        for nome, conf in _atribuicoes(r, elenco):
-            _arquivar(anime, nome, {**cena, "confidence": conf})
+        for nome, conf, cid in _atribuicoes(r, elenco):
+            _arquivar(anime, nome, cid, {**cena, "confidence": conf})
 
     saida = list(animes.values())
     for a in saida:
@@ -115,7 +121,9 @@ def listar(db: Database, output_dir: Path | str) -> list[AnimeFavorito]:
     return saida
 
 
-def _atribuicoes(r: dict, elenco: dict[int, list[dict]]) -> list[tuple[str, float | None]]:
+def _atribuicoes(
+    r: dict, elenco: dict[int, list[dict]]
+) -> list[tuple[str, float | None, int]]:
     """De quem é este favorito — uma pasta, ou várias.
 
     Favoritar dentro da pasta de um personagem grava de quem é. Favoritar em
@@ -126,13 +134,17 @@ def _atribuicoes(r: dict, elenco: dict[int, list[dict]]) -> list[tuple[str, floa
     """
     escolhido = str(r["character_name"] or "").strip()
     if int(r["character_id"] or 0) and escolhido:
-        return [(escolhido, r["confidence"])]
+        return [(escolhido, r["confidence"], int(r["character_id"]))]
 
-    achados = [(d["name"], d["confidence"]) for d in elenco.get(int(r["shot_id"]), []) if d["name"]]
-    return achados or [(SEM_PERSONAGEM, r["confidence"])]
+    achados = [
+        (d["name"], d["confidence"], d["character_id"])
+        for d in elenco.get(int(r["shot_id"]), [])
+        if d["name"]
+    ]
+    return achados or [(SEM_PERSONAGEM, r["confidence"], 0)]
 
 
-def _arquivar(anime: AnimeFavorito, nome: str, cena: dict) -> None:
+def _arquivar(anime: AnimeFavorito, nome: str, cid: int, cena: dict) -> None:
     """Põe a cena no grupo do personagem, unindo as grafias dele.
 
     "Greyrat, Rudeus" e "Rudeus" são um só, pela mesma regra da busca por
@@ -147,6 +159,8 @@ def _arquivar(anime: AnimeFavorito, nome: str, cena: dict) -> None:
     if grupo is None:
         grupo = GrupoFavorito(personagem=nome)
         anime.personagens.append(grupo)
+    if cid and cid not in grupo.ids:
+        grupo.ids.append(cid)
     # Banco antigo pode ter a MESMA cena favoritada duas vezes (solta e dentro
     # da pasta do personagem) — hoje isso não acontece mais, mas é um clipe só
     # na tela de qualquer jeito. O clique explícito manda na confiança: foi um

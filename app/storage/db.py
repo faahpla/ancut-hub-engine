@@ -317,6 +317,32 @@ class Database:
                 ).fetchall()
             return {int(r[0]) for r in rows}
 
+    def shot_context(self, shot_id: int) -> dict | None:
+        """A cena com o episódio e o anime dela — o que a marcação precisa.
+
+        Marcar um personagem numa cena mexe em três lugares (banco, disco e a
+        decisão que sobrevive à reanálise), e todos pedem peças diferentes:
+        `output_root` e `file` pro hardlink, `idx` e `episode_id` pro
+        override, `anime_id` pra achar o personagem certo.
+        """
+        with self.connect() as c:
+            r = c.execute(
+                "SELECT s.id, s.idx, s.file, s.episode_id, "
+                "       e.output_root, e.anime_id "
+                "  FROM shot s JOIN episode e ON e.id = s.episode_id "
+                " WHERE s.id = ?",
+                (shot_id,),
+            ).fetchone()
+            return dict(r) if r else None
+
+    def character_row(self, character_id: int) -> dict | None:
+        with self.connect() as c:
+            r = c.execute(
+                "SELECT id, name, anime_id FROM character WHERE id = ?",
+                (character_id,),
+            ).fetchone()
+            return dict(r) if r else None
+
     def characters_of_favorites(self) -> dict[int, list[dict]]:
         """Quem aparece em cada cena favoritada, do mais confiante pro menos.
 

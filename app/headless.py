@@ -1035,6 +1035,27 @@ def _fav_toggle(shot_id: int, character_id: int = 0) -> None:
     })
 
 
+def _tag_shot(shot_id: int, character_id: int, remover: bool) -> None:
+    """Marca (ou desmarca) o personagem numa cena.
+
+    Correção manual: o reconhecimento erra e cala, e sem isto a cena ficava
+    presa em "Sem personagem" pra sempre. Ver `storage/marcar.py` — mexe no
+    banco, no disco e na decisão que sobrevive à reanálise.
+    """
+    from .config import Config
+    from .storage.db import Database
+    from .storage.marcar import ErroDeMarcacao, marcar
+
+    cfg = Config.load()
+    db = Database(cfg.cache_path / "index.db")
+    try:
+        payload = marcar(db, shot_id, character_id, remover)
+    except ErroDeMarcacao as e:
+        _emit({"type": "tag-shot", "error": str(e)})
+        return
+    _emit({"type": "tag-shot", **payload})
+
+
 def _favorites() -> None:
     """Favoritos do acervo, em anime → personagem → cenas."""
     from .config import Config
@@ -1577,6 +1598,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if mode == "favorites":
             _favorites()
+            return 0
+        if mode == "tag-shot":
+            _tag_shot(int(args[1]), int(args[2]), remover=(len(args) > 3 and args[3] == "remove"))
             return 0
         if mode == "characters":
             _characters(args[1] if len(args) > 1 else "")
