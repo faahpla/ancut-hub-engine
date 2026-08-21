@@ -43,7 +43,9 @@ class AnimeFavorito:
 
     @property
     def total(self) -> int:
-        return sum(len(g.cenas) for g in self.personagens)
+        # CENAS distintas, não entradas. Um clipe com Rudeus e Eris aparece
+        # nas duas pastas — continua sendo um clipe favoritado.
+        return len({c["id"] for g in self.personagens for c in g.cenas})
 
     def payload(self) -> dict:
         return {
@@ -64,6 +66,7 @@ def listar(db: Database, output_dir: Path | str) -> list[AnimeFavorito]:
     """Favoritos do acervo inteiro, em anime → personagem → cenas."""
     base = Path(output_dir).resolve()
     animes: dict[str, AnimeFavorito] = {}
+    elenco = db.characters_of_favorites()
 
     for r in db.favorites():
         raiz = Path(str(r["output_root"] or ""))
@@ -72,28 +75,17 @@ def listar(db: Database, output_dir: Path | str) -> list[AnimeFavorito]:
         arquivo = raiz / str(r["file"] or "")
         kf = raiz / str(r["keyframe"]) if r["keyframe"] else None
         pasta = raiz.parent.name
-        nome = str(r["character_name"] or "").strip() or SEM_PERSONAGEM
 
         anime = animes.get(pasta.lower())
         if anime is None:
             anime = AnimeFavorito(pasta=pasta)
             animes[pasta.lower()] = anime
 
-        # As grafias do mesmo personagem são unidas aqui também, pela mesma
-        # regra da busca por personagem: "Greyrat, Rudeus" e "Rudeus" são um
-        # só, e favoritos feitos em temporadas diferentes têm que cair juntos.
-        alvo = (
-            find_token_match(nome, [g.personagem for g in anime.personagens])
-            if nome != SEM_PERSONAGEM
-            else (SEM_PERSONAGEM if any(g.personagem == SEM_PERSONAGEM for g in anime.personagens) else None)
-        )
-        grupo = next((g for g in anime.personagens if g.personagem == alvo), None)
-        if grupo is None:
-            grupo = GrupoFavorito(personagem=nome)
-            anime.personagens.append(grupo)
-
-        grupo.cenas.append({
+        cena = {
             "id": r["shot_id"],
+            # O id gravado, SEMPRE — é a chave do favorito. A estrela da
+            # Biblioteca desfavorita com este par; mandar o personagem
+            # deduzido faria o clique CRIAR um favorito novo em vez de tirar.
             "characterId": r["character_id"],
             "idx": r["idx"],
             "file": _rel(arquivo, base),
@@ -106,7 +98,10 @@ def listar(db: Database, output_dir: Path | str) -> list[AnimeFavorito]:
             "kind": r["kind"] or "",
             "episodeId": r["episode_id"],
             "favoritedAt": r["created_at"],
-        })
+        }
+
+        for nome, conf in _atribuicoes(r, elenco):
+            _arquivar(anime, nome, {**cena, "confidence": conf})
 
     saida = list(animes.values())
     for a in saida:
@@ -114,5 +109,51 @@ def listar(db: Database, output_dir: Path | str) -> list[AnimeFavorito]:
         a.personagens.sort(
             key=lambda g: (g.personagem == SEM_PERSONAGEM, -len(g.cenas), g.personagem.lower())
         )
+        for g in a.personagens:
+            g.cenas.sort(key=lambda c: (c["season"] or 0, c["episode"] or 0, c["idx"] or 0))
     saida.sort(key=lambda a: (-a.total, a.pasta.lower()))
     return saida
+
+
+def _atribuicoes(r: dict, elenco: dict[int, list[dict]]) -> list[tuple[str, float | None]]:
+    """De quem é este favorito — uma pasta, ou várias.
+
+    Favoritar dentro da pasta de um personagem grava de quem é. Favoritar em
+    "Todas as cenas" grava `character_id = 0`: o clique não disse. Aí vale
+    quem o reconhecimento achou na cena — a MESMA verdade que montou
+    `by_character/` no disco, onde um clipe de dois personagens mora nas duas
+    pastas. Só cena sem ninguém identificado é que vai pro balaio.
+    """
+    escolhido = str(r["character_name"] or "").strip()
+    if int(r["character_id"] or 0) and escolhido:
+        return [(escolhido, r["confidence"])]
+
+    achados = [(d["name"], d["confidence"]) for d in elenco.get(int(r["shot_id"]), []) if d["name"]]
+    return achados or [(SEM_PERSONAGEM, r["confidence"])]
+
+
+def _arquivar(anime: AnimeFavorito, nome: str, cena: dict) -> None:
+    """Põe a cena no grupo do personagem, unindo as grafias dele.
+
+    "Greyrat, Rudeus" e "Rudeus" são um só, pela mesma regra da busca por
+    personagem: favoritos feitos em temporadas diferentes têm que cair juntos.
+    """
+    if nome == SEM_PERSONAGEM:
+        alvo = SEM_PERSONAGEM if any(g.personagem == SEM_PERSONAGEM for g in anime.personagens) else None
+    else:
+        alvo = find_token_match(nome, [g.personagem for g in anime.personagens if g.personagem != SEM_PERSONAGEM])
+
+    grupo = next((g for g in anime.personagens if g.personagem == alvo), None)
+    if grupo is None:
+        grupo = GrupoFavorito(personagem=nome)
+        anime.personagens.append(grupo)
+    # Banco antigo pode ter a MESMA cena favoritada duas vezes (solta e dentro
+    # da pasta do personagem) — hoje isso não acontece mais, mas é um clipe só
+    # na tela de qualquer jeito. O clique explícito manda na confiança: foi um
+    # clique de verdade naquele personagem, não dedução.
+    ja = next((c for c in grupo.cenas if c["id"] == cena["id"]), None)
+    if ja is None:
+        grupo.cenas.append(cena)
+    elif cena["characterId"]:
+        ja["characterId"] = cena["characterId"]
+        ja["confidence"] = cena["confidence"]

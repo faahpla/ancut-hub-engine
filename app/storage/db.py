@@ -278,21 +278,23 @@ class Database:
             )
 
     def toggle_favorite(self, shot_id: int, character_id: int = 0) -> bool:
-        """Liga/desliga o favorito. Devolve o estado NOVO.
+        """Liga/desliga o favorito da CENA. Devolve o estado NOVO.
 
         Devolver o estado em vez de void é o que deixa a tela acertar a
         estrela sem ter que perguntar de novo.
+
+        Favoritar grava de quem foi o clique (`character_id`, ou 0 na visão
+        "Todas as cenas"). Desfavoritar apaga TODAS as linhas da cena, e é de
+        propósito: a estrela é uma só na tela, e o usuário lê "favoritado" ou
+        "não". Apagar só a linha daquele personagem deixaria a estrela cheia
+        depois do clique que era pra esvaziá-la.
         """
         with self.connect() as c:
             achou = c.execute(
-                "SELECT 1 FROM favorite WHERE shot_id=? AND character_id=?",
-                (shot_id, character_id),
+                "SELECT 1 FROM favorite WHERE shot_id=?", (shot_id,)
             ).fetchone()
             if achou:
-                c.execute(
-                    "DELETE FROM favorite WHERE shot_id=? AND character_id=?",
-                    (shot_id, character_id),
-                )
+                c.execute("DELETE FROM favorite WHERE shot_id=?", (shot_id,))
                 return False
             c.execute(
                 "INSERT INTO favorite(shot_id, character_id) VALUES(?,?)",
@@ -301,7 +303,10 @@ class Database:
             return True
 
     def favorite_shot_ids(self, character_id: int | None = None) -> set[int]:
-        """Ids das cenas favoritas — de um personagem, ou de todos."""
+        """Ids das cenas favoritas — de um personagem, ou de todos.
+
+        A estrela da grade usa a versão SEM personagem: favoritar é da cena.
+        """
         with self.connect() as c:
             if character_id is None:
                 rows = c.execute("SELECT DISTINCT shot_id FROM favorite").fetchall()
@@ -311,6 +316,33 @@ class Database:
                     (character_id,),
                 ).fetchall()
             return {int(r[0]) for r in rows}
+
+    def characters_of_favorites(self) -> dict[int, list[dict]]:
+        """Quem aparece em cada cena favoritada, do mais confiante pro menos.
+
+        Serve pro favorito feito em "Todas as cenas", que grava
+        `character_id = 0` — ali o clique não disse de quem era. Quem está na
+        cena o banco JÁ sabe, e é a mesma verdade que gerou as pastas
+        `by_character/`: um clipe mora na pasta de cada personagem que ele
+        tem. Sem isto o favorito cairia no balaio "Sem personagem" mesmo com
+        a Roxy identificada com 0,92 de confiança.
+        """
+        with self.connect() as c:
+            rows = c.execute(
+                "SELECT sc.shot_id, sc.character_id, sc.confidence, ch.name "
+                "  FROM shot_character sc "
+                "  JOIN character ch ON ch.id = sc.character_id "
+                " WHERE sc.shot_id IN (SELECT shot_id FROM favorite) "
+                " ORDER BY sc.shot_id, sc.confidence DESC"
+            ).fetchall()
+        saida: dict[int, list[dict]] = {}
+        for r in rows:
+            saida.setdefault(int(r["shot_id"]), []).append({
+                "character_id": int(r["character_id"]),
+                "name": str(r["name"] or "").strip(),
+                "confidence": r["confidence"],
+            })
+        return saida
 
     def favorites(self) -> list[dict]:
         """Todo favorito, com a cena, o episódio e o personagem juntos.

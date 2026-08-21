@@ -589,10 +589,10 @@ def _shots(episode_id: int, character_id: int) -> None:
     else:
         rows = db.shots_for_character(character_id, episode_id=episode_id)
 
-    # Marca quais já são favoritas NESTE contexto (o personagem aberto, ou 0
-    # na visão de todas). Sem isto a estrela nasceria vazia em cena que já é
-    # favorita, e o clique seguinte desfavoritaria sem querer.
-    favoritas = db.favorite_shot_ids(max(character_id, 0))
+    # Favorito é da CENA: a estrela enche em qualquer pasta se o clipe já foi
+    # favoritado em alguma. Olhar só a chave deste personagem faria a mesma
+    # cena aparecer favoritada numa tela e não na outra.
+    favoritas = db.favorite_shot_ids()
     rows = [{**r, "favorite": r["id"] in favoritas} for r in rows]
     _emit(
         {
@@ -1081,11 +1081,7 @@ def _character_shots(ids: list[int]) -> None:
     cfg = Config.load()
     db = Database(cfg.cache_path / "index.db")
     cenas = cenas_de(db, cfg.output_dir, ids)
-    # Aqui o contexto são VÁRIAS linhas do mesmo personagem (as grafias
-    # unidas), então a cena é favorita se qualquer uma delas a marcou.
-    favoritas: set[int] = set()
-    for cid in ids:
-        favoritas |= db.favorite_shot_ids(cid)
+    favoritas = db.favorite_shot_ids()
     _emit({
         "type": "character-shots",
         "outputDir": str(cfg.output_dir),
