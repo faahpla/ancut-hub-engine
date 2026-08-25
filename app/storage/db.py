@@ -431,6 +431,29 @@ class Database:
             ).fetchall()
             return [dict(r) for r in rows]
 
+    def shot_stats_by_root(self, ids: list[int]) -> list[dict]:
+        """Cenas e episódios deste personagem, POR PASTA de episódio.
+
+        A pasta do anime sai daqui em Python, nunca em SQL: juntar ou cortar
+        caminho no banco já custou 95 miniaturas quebradas (ver
+        `characters_with_shots`).
+        """
+        if not ids:
+            return []
+        marcas = ",".join("?" * len(ids))
+        with self.connect() as c:
+            rows = c.execute(
+                "SELECT e.output_root, COUNT(DISTINCT s.id) AS n, "
+                "       COUNT(DISTINCT e.id) AS eps "
+                "  FROM shot_character sc "
+                "  JOIN shot s ON s.id = sc.shot_id "
+                "  JOIN episode e ON e.id = s.episode_id "
+                f" WHERE sc.character_id IN ({marcas}) AND e.output_root IS NOT NULL "
+                " GROUP BY e.output_root",
+                ids,
+            ).fetchall()
+            return [dict(r) for r in rows]
+
     def shot_stats_for_characters(self, ids: list[int]) -> tuple[int, int, list[str]]:
         """(cenas distintas, episódios distintos, pastas de episódio).
 

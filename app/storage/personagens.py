@@ -39,6 +39,11 @@ class GrupoPersonagem:
     cenas: int = 0
     episodios: int = 0
     animes: list[str] = field(default_factory=list)
+    # Quanto ele tem em CADA anime. A lista de nomes não bastava: a aba
+    # Personagem passou a separar por anime, e o Ichigo está em duas pastas
+    # de Bleach — mostrar as 211 cenas dele nas duas seções seria mentira nas
+    # duas.
+    por_anime: list[dict] = field(default_factory=list)
     amostra: str = ""
 
     def payload(self) -> dict:
@@ -49,6 +54,7 @@ class GrupoPersonagem:
             "shots": self.cenas,
             "episodes": self.episodios,
             "animes": self.animes,
+            "byAnime": self.por_anime,
             "sample": self.amostra,
         }
 
@@ -103,6 +109,7 @@ def listar(db: Database, output_dir: Path | str, termo: str = "") -> list[GrupoP
         g.episodios = episodios
         g.animes = [Path(a).parent.name for a in animes if a]
         g.animes = sorted(set(g.animes))
+        g.por_anime = _por_anime(db, g.ids)
 
     grupos = [g for g in grupos if g.cenas > 0]
     if termo:
@@ -140,3 +147,22 @@ def cenas_de(db: Database, output_dir: Path | str, ids: list[int]) -> list[dict]
             "episodeId": r["episode_id"],
         })
     return saida
+
+
+def _por_anime(db: Database, ids: list[int]) -> list[dict]:
+    """Dobra as pastas de episódio na pasta do ANIME, somando.
+
+    As contagens vêm por episódio e são somadas aqui: uma cena pertence a um
+    episódio só, então somar não conta ninguém duas vezes — diferente do
+    total do grupo, onde duas grafias podem apontar pra mesma cena e o
+    DISTINCT é obrigatório.
+    """
+    caixas: dict[str, dict] = {}
+    for r in db.shot_stats_by_root(ids):
+        pasta = Path(str(r["output_root"])).parent.name
+        if not pasta:
+            continue
+        caixa = caixas.setdefault(pasta, {"anime": pasta, "shots": 0, "episodes": 0})
+        caixa["shots"] += int(r["n"] or 0)
+        caixa["episodes"] += int(r["eps"] or 0)
+    return sorted(caixas.values(), key=lambda x: (-x["shots"], x["anime"].lower()))
