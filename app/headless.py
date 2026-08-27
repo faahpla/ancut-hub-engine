@@ -496,6 +496,10 @@ def _results(episode_id: int) -> None:
             "kind": ep["kind"],
             "episodeRoot": ep["output_root"],
             "totalShots": len(db.shots_for_episode(episode_id)),
+            # Quantas cenas ficaram sem ninguém. Vai junto pra a lista poder
+            # mostrar o número sem uma segunda ida ao motor — que custa uma
+            # abertura de processo inteira.
+            "untaggedShots": db.count_shots_without_character(episode_id),
             "characters": characters,
             "refsDir": _refs_dir_for(cfg, ep["anilist_id"], ep["mal_id"]),
             # Pro "identificar depois": a tela precisa do vídeo de origem e da
@@ -568,18 +572,30 @@ def _refs_dir_for(cfg: Any, anilist_id: int | None, mal_id: int | None) -> str |
     return str(resolve_anime_dir(cfg.cache_path, cache_id) / "characters")
 
 
+#: `character_id` da lista "Sem personagem" — as cenas sem ninguém reconhecido.
+#: Negativo pra não colidir com id de personagem nem com o 0 de "todas".
+SEM_PERSONAGEM_ID = -2
+
+
 def _shots(episode_id: int, character_id: int) -> None:
-    """Cenas de um personagem — ou TODAS do episódio quando character_id <= 0.
+    """Cenas de um personagem, TODAS do episódio (0), ou as SEM ninguém (-2).
 
     A visão de todas existe pra mesclar: um corte partido no meio de uma cena
     só aparece inteiro olhando a linha do tempo, não a pasta de um personagem.
+    A visão sem ninguém existe pra limpar: é onde mora o cenário — e o
+    personagem que o reconhecimento deixou passar.
     """
     from .config import Config
     from .storage.db import Database
 
     cfg = Config.load()
     db = Database(cfg.cache_path / "index.db")
-    if character_id <= 0:
+    if character_id == SEM_PERSONAGEM_ID:
+        rows = [
+            {**r, "confidence": None, "approved": None}
+            for r in db.shots_without_character(episode_id)
+        ]
+    elif character_id <= 0:
         # shots_for_episode não traz confiança nem revisão: elas pertencem ao
         # par (shot, personagem), e aqui um shot pode ter vários ou nenhum.
         rows = [
@@ -1035,7 +1051,7 @@ def _fav_toggle(shot_id: int, character_id: int = 0) -> None:
     })
 
 
-def _tag_shot(shot_id: int, character_id: int, remover: bool) -> None:
+def _tag_shot(shot_ids: list[int], character_id: int, remover: bool) -> None:
     """Marca (ou desmarca) o personagem numa cena.
 
     Correção manual: o reconhecimento erra e cala, e sem isto a cena ficava
@@ -1044,12 +1060,12 @@ def _tag_shot(shot_id: int, character_id: int, remover: bool) -> None:
     """
     from .config import Config
     from .storage.db import Database
-    from .storage.marcar import ErroDeMarcacao, marcar
+    from .storage.marcar import ErroDeMarcacao, marcar_varias
 
     cfg = Config.load()
     db = Database(cfg.cache_path / "index.db")
     try:
-        payload = marcar(db, shot_id, character_id, remover)
+        payload = marcar_varias(db, shot_ids, character_id, remover)
     except ErroDeMarcacao as e:
         _emit({"type": "tag-shot", "error": str(e)})
         return
@@ -1628,7 +1644,11 @@ def main(argv: list[str] | None = None) -> int:
             _remove_character(int(args[1]), int(args[2]))
             return 0
         if mode == "tag-shot":
-            _tag_shot(int(args[1]), int(args[2]), remover=(len(args) > 3 and args[3] == "remove"))
+            _tag_shot(
+                [int(x) for x in args[1].split(",") if x.strip()],
+                int(args[2]),
+                remover=(len(args) > 3 and args[3] == "remove"),
+            )
             return 0
         if mode == "characters":
             _characters(args[1] if len(args) > 1 else "")

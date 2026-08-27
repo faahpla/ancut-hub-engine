@@ -57,6 +57,29 @@ def _resolver(db: Database, anime_id: int, nome: str, id_original: int) -> tuple
     return id_original, nome
 
 
+def marcar_varias(
+    db: Database, shot_ids: list[int], character_id: int, remover: bool = False
+) -> dict:
+    """O mesmo que `marcar`, para um punhado de cenas de uma vez.
+
+    Uma chamada só porque cada ida ao motor abre um processo congelado, e o
+    primeiro atendimento dele custa segundos. Marcar 40 cenas uma a uma seria
+    esperar minutos por um trabalho de milissegundos.
+    """
+    ultimo: dict = {}
+    feitas = 0
+    for sid in shot_ids:
+        try:
+            ultimo = marcar(db, sid, character_id, remover)
+            feitas += 1
+        except ErroDeMarcacao:
+            # Uma cena que sumiu no meio do caminho não derruba as outras.
+            continue
+    if not ultimo:
+        raise ErroDeMarcacao("nenhuma das cenas existe mais")
+    return {**ultimo, "count": feitas}
+
+
 def marcar(db: Database, shot_id: int, character_id: int, remover: bool = False) -> dict:
     """Liga (ou desliga) o personagem nesta cena. Devolve o estado novo."""
     cena = db.shot_context(shot_id)

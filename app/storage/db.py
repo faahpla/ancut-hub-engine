@@ -732,6 +732,37 @@ class Database:
             rows = c.execute(query, args).fetchall()
             return [dict(r) for r in rows]
 
+    def shots_without_character(self, episode_id: int) -> list[dict]:
+        """As cenas do episódio em que NINGUÉM foi reconhecido.
+
+        É o resto: cenário, plano de objeto, silhueta de costas — e também o
+        personagem que o reconhecimento perdeu. Ver tudo isso junto é o que
+        permite jogar fora o que não serve e resgatar o que serve; espalhado
+        entre 400 cenas, nem uma coisa nem outra acontece.
+        """
+        with self.connect() as c:
+            rows = c.execute(
+                "SELECT s.id, s.idx, s.file, s.keyframe, s.start, s.end, s.duration "
+                "  FROM shot s "
+                " WHERE s.episode_id = ? "
+                "   AND NOT EXISTS (SELECT 1 FROM shot_character sc "
+                "                    WHERE sc.shot_id = s.id) "
+                " ORDER BY s.idx",
+                (episode_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def count_shots_without_character(self, episode_id: int) -> int:
+        with self.connect() as c:
+            return int(
+                c.execute(
+                    "SELECT COUNT(*) FROM shot s WHERE s.episode_id = ? "
+                    "AND NOT EXISTS (SELECT 1 FROM shot_character sc "
+                    "                 WHERE sc.shot_id = s.id)",
+                    (episode_id,),
+                ).fetchone()[0]
+            )
+
     def shots_for_episode(self, episode_id: int) -> list[dict]:
         with self.connect() as c:
             rows = c.execute(
