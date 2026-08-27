@@ -1056,6 +1056,25 @@ def _tag_shot(shot_id: int, character_id: int, remover: bool) -> None:
     _emit({"type": "tag-shot", **payload})
 
 
+def _remove_character(episode_id: int, character_id: int) -> None:
+    """Tira um personagem inteiro de um episódio (reconhecimento errado).
+
+    As cenas ficam: o que sai é o vínculo. Ver `storage/marcar.py`.
+    """
+    from .config import Config
+    from .storage.db import Database
+    from .storage.marcar import ErroDeMarcacao, remover_personagem
+
+    cfg = Config.load()
+    db = Database(cfg.cache_path / "index.db")
+    try:
+        payload = remover_personagem(db, episode_id, character_id)
+    except ErroDeMarcacao as e:
+        _emit({"type": "remove-character", "error": str(e)})
+        return
+    _emit({"type": "remove-character", **payload})
+
+
 def _favorites() -> None:
     """Favoritos do acervo, em anime → personagem → cenas."""
     from .config import Config
@@ -1460,6 +1479,8 @@ def _discovery_naming_round(
     de megabytes.
     """
     # 1) Grava os recortes que a tela de batismo vai mostrar.
+    from .pipeline import _MIN_CENAS_RELEVANTE
+
     crops_dir = Path(disc.episode_root) / "metadata" / "discovery"
     crops_dir.mkdir(parents=True, exist_ok=True)
     for old in crops_dir.glob("*.jpg"):
@@ -1477,6 +1498,10 @@ def _discovery_naming_round(
                 "key": g.key,
                 "faces": g.n_faces,
                 "shots": g.n_shots,
+                # Figurante: aparece em menos cenas do que o piso. A tela
+                # esconde estes atrás de um botão em vez de perguntar o nome
+                # de duzentos NPCs de fundo.
+                "minor": g.n_shots < _MIN_CENAS_RELEVANTE,
                 # Índice em ref_crops_jpg == índice nesta lista: é o que o
                 # host devolve em `removed`.
                 "crops": crop_files,
@@ -1598,6 +1623,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if mode == "favorites":
             _favorites()
+            return 0
+        if mode == "remove-character":
+            _remove_character(int(args[1]), int(args[2]))
             return 0
         if mode == "tag-shot":
             _tag_shot(int(args[1]), int(args[2]), remover=(len(args) > 3 and args[3] == "remove"))

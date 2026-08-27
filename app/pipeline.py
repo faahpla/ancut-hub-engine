@@ -106,6 +106,16 @@ def _cache_id_for(bundle) -> str:
     return f"mal{bundle.mal_id}"
 
 
+#: A partir de quantas cenas um grupo descoberto deixa de ser figurante.
+#:
+#: Um episódio devolve centenas de grupos (252 num Demon Slayer, com 4867
+#: rostos) e a esmagadora maioria é NPC de fundo: aparece numa cena, some.
+#: Perguntar o nome de todos eles é o que faz a tela de batismo virar uma
+#: parede. Duas cenas é o piso do que pode virar personagem recorrente — e
+#: nada é jogado fora: os de baixo continuam lá, atrás de um botão.
+_MIN_CENAS_RELEVANTE = 2
+
+
 def _noop(stage: str, frac: float, msg: str) -> None:
     pass
 
@@ -1857,9 +1867,22 @@ class Pipeline:
                 suggested_name=suggested,
                 suggested_sim=s_sim,
             ))
+        # Ordem por CENAS, não por rostos.
+        #
+        # O que decide se um personagem importa é em quantas cenas ele
+        # aparece — rosto é só quantas vezes o detector o pegou, e um
+        # figurante parado num plano longo rende mais rostos que um
+        # protagonista em três cenas rápidas. A tela de batismo pergunta na
+        # ordem de quem interessa.
+        groups.sort(key=lambda g: (-g.n_shots, -g.n_faces))
+        for novo_key, g in enumerate(groups):
+            g.key = novo_key
+
+        relevantes = sum(1 for g in groups if g.n_shots >= _MIN_CENAS_RELEVANTE)
         cb("organize", 1.0, f"{len(groups)} personagens descobertos")
         print(f"[Descoberta] {len(observations)} rostos → {len(groups)} grupos "
-              f"({', '.join(str(g.n_faces) for g in groups[:10])}...)", flush=True)
+              f"({relevantes} com {_MIN_CENAS_RELEVANTE}+ cenas; "
+              f"cenas: {', '.join(str(g.n_shots) for g in groups[:10])}...)", flush=True)
 
         self._report_timings(timer, metadata_dir)
         return DiscoveryResult(

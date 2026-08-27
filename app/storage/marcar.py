@@ -115,3 +115,39 @@ def _desfazer_pasta(raiz: Path, nome: str, arquivo: str) -> None:
         # Arquivo aberto no Explorer, pasta em uso: o banco já foi corrigido e
         # é ele que manda na tela. Não vale derrubar a marcação por isso.
         pass
+
+
+def remover_personagem(db: Database, episode_id: int, character_id: int) -> dict:
+    """Tira um personagem inteiro de um episódio.
+
+    Para quando o reconhecimento inventa alguém: 21 cenas atribuídas a uma
+    "Kamado, Hanako" que não está em nenhuma delas. Sem isto, a única saída
+    era reanalisar o episódio e torcer.
+
+    **As cenas NÃO são apagadas.** O que sai é o vínculo: os clipes continuam
+    em `shots/` e continuam aparecendo em "Todas as cenas". Some a pasta
+    `by_character/<Nome>/` (que é só hardlink) e some o nome da lista.
+
+    O `block` em `manual_override` é o que faz a correção durar: sem ele a
+    próxima análise do episódio traria o mesmo engano de volta, e o usuário
+    apagaria de novo achando que o app não obedece.
+    """
+    quem = db.character_row(character_id)
+    if not quem:
+        raise ErroDeMarcacao(f"personagem {character_id} não existe mais")
+    nome = str(quem["name"])
+
+    cenas = db.shots_for_character(character_id, episode_id=episode_id)
+    raiz: Path | None = None
+    for c in cenas:
+        cena = db.shot_context(int(c["id"]))
+        if not cena:
+            continue
+        raiz = Path(str(cena["output_root"] or "")) or None
+        db.remove_shot_character(int(c["id"]), character_id)
+        db.record_manual(episode_id, int(cena["idx"]), character_id, "block")
+        if raiz and raiz.name:
+            _desfazer_pasta(raiz, nome, Path(str(cena["file"] or "")).name)
+
+    return {"episodeId": episode_id, "characterId": character_id,
+            "character": nome, "removed": len(cenas)}
