@@ -116,6 +116,36 @@ def _cache_id_for(bundle) -> str:
 _MIN_CENAS_RELEVANTE = 2
 
 
+def _corte_agrupamento(cfg) -> float:
+    """O corte de similaridade que junta dois rostos no mesmo grupo.
+
+    É do BACKEND, não do agrupamento: cada modelo tem a sua escala. O 0,86 do
+    CLIP em anime, aplicado ao ArcFace, dá ZERO grupo — medido. Ver
+    `matching/rosto_real.CORTE_AGRUPAMENTO`.
+    """
+    if cfg.media_kind == "live":
+        from .matching.rosto_real import CORTE_AGRUPAMENTO
+
+        return CORTE_AGRUPAMENTO
+    from .matching.face_clustering import cluster_faces as _cf
+
+    return float(_cf.__defaults__[0])  # o 0.86 declarado na assinatura
+
+
+def _provider_para(cfg):
+    """Quem sabe o elenco desta mídia.
+
+    Anime pergunta pro AniList/Jikan; filme e série perguntam pro TMDB. Os
+    dois devolvem o MESMO `AnimeBundle`, então daqui pra baixo o pipeline não
+    sabe (nem precisa saber) de onde veio.
+    """
+    if cfg.media_kind == "live":
+        from .providers.tmdb import TmdbProvider
+
+        return TmdbProvider(cfg.tmdb_api_key)
+    return AnimeProvider(cfg.cache_path)
+
+
 def _noop(stage: str, frac: float, msg: str) -> None:
     pass
 
@@ -163,8 +193,15 @@ class Pipeline:
         #
         # Custa nada trocar a ordem: com o anime já conhecido esta etapa sai
         # do cache em ~0s (ver o disjuntor e o banco parcial na v1.8.1).
-        cb("fetch_characters", -1.0, "Consultando AniList + Jikan...")
-        provider = AnimeProvider(cfg.cache_path)
+        fonte = "TMDB" if cfg.media_kind == "live" else "AniList + Jikan"
+        cb("fetch_characters", -1.0, f"Consultando {fonte}...")
+        provider = _provider_para(cfg)
+        # Ano e "é série?" só existem no TMDB — o AniList não tem onde pôr.
+        extra = (
+            {"ano": info.year, "serie": info.kind != "MOVIE"}
+            if cfg.media_kind == "live"
+            else {}
+        )
         try:
             bundle = provider.resolve(
                 info.anime,
@@ -174,13 +211,16 @@ class Pipeline:
                 use_danbooru=cfg.use_danbooru,
                 gallery_for_top=cfg.gallery_for_top_characters,
                 season=info.season,
+                **extra,
             )
         finally:
             provider.close()
         # Fonte fora do ar? Guarda pra avisar — no progresso agora e, se a
         # análise morrer por falta de refs, na mensagem de erro ("tenta de
         # novo mais tarde" só é bom conselho quando é confirmado).
-        source_warnings = list(provider.source_warnings)
+        # O TMDB não tem disjuntor de fonte: é uma API só, e ela responde ou
+        # levanta. `getattr` em vez de dois caminhos de código.
+        source_warnings = list(getattr(provider, "source_warnings", []))
         for w in source_warnings:
             print(f"[CorteCenas] AVISO de fonte: {w}", flush=True)
         cb("fetch_characters", 1.0, f"{len(bundle.characters)} personagens")
@@ -705,8 +745,13 @@ class Pipeline:
         # Vem ANTES da segunda passada de propósito: as cenas identificadas
         # viram referência do próprio episódio ali, e deixar um erro apertado
         # entrar nesse banco espalharia o erro pelo episódio inteiro.
+        #
+        # Em live action o CCIP não entra: ele foi treinado pra dizer se dois
+        # DESENHOS são o mesmo personagem, e a decisão apertada que ele
+        # existe pra arbitrar já não acontece — o ArcFace separa com margem
+        # de 0,33 onde o CLIP trabalhava com 0,077.
         juiz_ccip = None
-        if cfg.ccip_veto and entries and not use_ai_recognition:
+        if cfg.ccip_veto and entries and not use_ai_recognition and cfg.media_kind != "live":
             juiz_ccip = self._veto_ccip(
                 cb=cb,
                 entries=entries,
@@ -839,7 +884,9 @@ class Pipeline:
                 ]
                 cb("second_pass", -1.0,
                    f"Agrupando {len(observations)} rostos que sobraram sem dono...")
-                clusters = cluster_faces(observations)
+                clusters = cluster_faces(
+                    observations, cut=_corte_agrupamento(cfg)
+                )
             n_group_shots = 0
             n_groups_named = 0
             for cl in clusters:
@@ -1619,9 +1666,13 @@ class Pipeline:
         # os grupos reforçam o banco REAL (refs em al<root>) e os nomes são
         # pré-sugeridos pelos centroides já conhecidos; se não resolver,
         # segue 100% offline com banco local.
-        cb("fetch_characters", -1.0, "Buscando anime (descoberta)...")
+        cb("fetch_characters", -1.0, "Buscando o título (descoberta)...")
         online_bundle = None
-        provider = AnimeProvider(cfg.cache_path)
+        # Vale pro TMDB também: com filme conhecido, os grupos descobertos
+        # saem com o nome do personagem pré-sugerido. Sem chave ou sem
+        # internet, cai no `except` e a descoberta segue offline — que é o
+        # ponto dela.
+        provider = _provider_para(cfg)
         try:
             online_bundle = provider.resolve(
                 info.anime,
@@ -1833,7 +1884,7 @@ class Pipeline:
         cb("second_pass", 1.0, "—")
         cb("ai_review", 1.0, "—")
         cb("organize", -1.0, f"Agrupando {len(observations)} rostos por personagem...")
-        clusters = cluster_faces(observations)
+        clusters = cluster_faces(observations, cut=_corte_agrupamento(cfg))
         # Sugestão de nome: centroide do grupo vs personagens já conhecidos
         # (existem quando o anime já foi analisado antes). 0.75 é conservador
         # — melhor campo vazio que sugestão errada pré-preenchida.
@@ -2156,6 +2207,17 @@ class Pipeline:
         holder: dict[str, object] = {"engine": None, "face_det": None}
 
         def get_engine() -> EmbeddingEngine:
+            if holder["engine"] is None and cfg.media_kind == "live":
+                # Live action: ArcFace. Ele responde a pergunta certa ("estas
+                # duas fotos são a mesma pessoa?") em vez de o CLIP responder
+                # de lado. Medido no LFW: mesma pessoa 0,48–0,82; pessoas
+                # diferentes -0,12–0,15. Margem de 0,33 onde o CLIP em anime
+                # trabalha com 0,077.
+                from .matching.rosto_real import IdentidadeRostoReal
+
+                cb("embed_refs", -1.0, "Carregando reconhecimento facial (ArcFace)...")
+                holder["engine"] = IdentidadeRostoReal(use_cuda=cfg.use_cuda)
+                return holder["engine"]
             if holder["engine"] is None:
                 clip_msg = "Carregando modelo CLIP..."
                 if _clip_needs_download(cfg.clip_model, cfg.clip_pretrained):
@@ -2176,6 +2238,15 @@ class Pipeline:
             return holder["engine"]
 
         def get_face_det() -> AnimeFaceDetector:
+            if holder["face_det"] is None and cfg.media_kind == "live":
+                # SCRFD: detecta e ainda devolve os 5 pontos do rosto, que é
+                # o que permite ALINHAR antes de reconhecer. Sem alinhar, o
+                # ArcFace perde acerto de graça.
+                from .matching.rosto_real import DetectorRostoReal
+
+                cb("embed_refs", -1.0, "Carregando detector de rosto (SCRFD)...")
+                holder["face_det"] = DetectorRostoReal(use_cuda=cfg.use_cuda)
+                return holder["face_det"]
             if holder["face_det"] is None:
                 # Face detector is also used for the references so the rep
                 # space matches: face crop (ref) vs face crop (query), not
@@ -2189,6 +2260,18 @@ class Pipeline:
     def _feature_meta(self) -> dict:
         """Tudo que, mudando, invalida boxes/embeddings cacheados."""
         cfg = self.cfg
+        if cfg.media_kind == "live":
+            from .matching.rosto_real import ASSINATURA
+
+            # O tipo de mídia entra na chave: embedding de ArcFace (512-d,
+            # rosto alinhado) e de CLIP (768-d, recorte com padding) vivem no
+            # MESMO arquivo `.npz`. Sem isto, reanalisar trocando o tipo leria
+            # o cache errado e compararia coisas incomparáveis.
+            return {
+                "backend": ASSINATURA,
+                "detector": ASSINATURA,
+                "credit_thr": cfg.credit_edge_threshold,
+            }
         return {
             "clip": f"{cfg.clip_model}/{cfg.clip_pretrained}",
             "detector": MODEL_SIGNATURE,

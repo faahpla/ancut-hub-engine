@@ -32,6 +32,8 @@ _PERSISTED_FIELDS = (
     # skip_credit_shots: intentionally NOT persisted — the heuristic is
     # fragile and we keep it OFF by default.
     "use_danbooru",
+    "media_kind",
+    "tmdb_api_key",
     "navyai_api_key",
     "navyai_base_url",
     "navyai_model",
@@ -242,6 +244,18 @@ class Config:
     credit_min_keyframes: int = 2
     # ViT-L/14: ~890MB download on first run, much better anime discrimination
     # than ViT-B/32. Fine on a 5080 (≈1.5GB VRAM, seconds per episode).
+    #: "anime" ou "live" (filme, série com gente de verdade).
+    #:
+    #: Decide QUEM olha o rosto: em anime, o YOLO da deepghs + CLIP; em live
+    #: action, SCRFD + ArcFace (`matching/rosto_real.py`). Não é preferência
+    #: — é o par de modelos que sabe responder a pergunta daquele material.
+    media_kind: str = "anime"
+
+    #: Chave da API do TMDB — o "AniList do cinema": elenco com foto de cada
+    #: ator. Vazia, o live action só funciona pelo Modo Descoberta (agrupa os
+    #: rostos e você dá os nomes), que não depende de fonte nenhuma.
+    tmdb_api_key: str = ""
+
     clip_model: str = "ViT-L-14"
     clip_pretrained: str = "openai"
 

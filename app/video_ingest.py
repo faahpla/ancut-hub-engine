@@ -66,6 +66,9 @@ class EpisodeInfo:
     #: IDENTIDADE: sem isto a abertura da 2ª temporada ocupava a mesma vaga
     #: que o episódio 1 dela, e uma sobrescrevia a outra.
     kind: str = ""
+    #: Ano do lançamento, quando o nome do arquivo traz ("Filme (2019)").
+    #: Só o TMDB usa — é o que desempata refilmagem de original.
+    year: int | None = None
     #: Pasta do anime na saída, quando o usuário escolheu uma explicitamente.
     #: Vazio = decide o motor (memória de pastas → nome digitado). Ver
     #: `storage/anime_folders.py`.
@@ -73,6 +76,11 @@ class EpisodeInfo:
 
     @property
     def slug(self) -> str:
+        # Filme não tem temporada nem episódio, e "S01-MOVIE1" seria inventar
+        # uma numeração. O ANO é o que distingue de verdade — e é o que
+        # permite quatro John Wick na mesma pasta da franquia sem colidir.
+        if self.kind == "MOVIE":
+            return f"Filme ({self.episode})" if self.episode > 1900 else "Filme"
         if self.kind:
             return f"S{self.season:02d}-{self.kind}{self.episode}"
         return f"S{self.season:02d}E{self.episode:02d}"
@@ -170,6 +178,17 @@ _KIND_PATTERNS = [
 ]
 
 
+#: Ano entre parênteses/colchetes ou solto — "Filme (2019)", "Filme.2019.1080p".
+#: 19xx/20xx só: 1080p e 2160p não são anos, e o limite superior evita pegar
+#: resolução como data.
+_ANO = re.compile(r"[(\[\s._-](19\d{2}|20[0-4]\d)[)\]\s._-]")
+
+
+def detect_year(text: str) -> int | None:
+    m = _ANO.search(f" {text} ")
+    return int(m.group(1)) if m else None
+
+
 def detect_kind(text: str) -> tuple[str, int | None]:
     """Abertura/encerramento no nome do arquivo. Devolve ("OP"|"ED"|"", nº)."""
     for pat, kind in _KIND_PATTERNS:
@@ -239,6 +258,23 @@ def parse_filename(video_path: str | Path) -> EpisodeInfo:
         # pro lugar certo; sem número no nome, assume a primeira.
         episode = kind_num if kind_num is not None else 1
 
+    # FILME: sem marca de temporada/episódio e com ano no nome.
+    #
+    # As duas condições juntas, nunca só o ano — "Bleach S17E05 (2022)" tem
+    # ano e é episódio. E `kind` é o lugar certo pra isso: ele já é parte da
+    # identidade no banco (`UNIQUE(anime, season, episode, kind)`), então
+    # filme entra sem migração nenhuma, ao lado de abertura e encerramento.
+    ano = detect_year(stem)
+    if not kind and not combined_hit and ano is not None:
+        kind = "MOVIE"
+        # O ano ocupa a vaga do episódio: é o que dá identidade única no banco
+        # (a chave é anime+temporada+episódio+tipo) e o que ordena a estante
+        # de uma franquia na ordem em que os filmes saíram.
+        season, episode = 1, ano
+        # O ano faz parte do nome do arquivo, não do título: "Matrix 1999"
+        # procurado no TMDB acha menos que "Matrix" com o ano de fora.
+        name = _ANO.sub(" ", f" {name} ").strip(" -_.") or name
+
     return EpisodeInfo(
-        anime=name, season=season, episode=episode, source=path, kind=kind
+        anime=name, season=season, episode=episode, source=path, kind=kind, year=ano
     )

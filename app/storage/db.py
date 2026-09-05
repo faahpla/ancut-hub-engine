@@ -28,7 +28,8 @@ CREATE TABLE IF NOT EXISTS episode (
     -- que não fica em lugar nenhum — era o que impedia reabrir um resultado
     -- antigo sem reanalisar.
     output_root TEXT,
-    -- '' = episódio, 'OP' = abertura, 'ED' = encerramento. Entra na chave
+    -- '' = episódio, 'OP' = abertura, 'ED' = encerramento, 'MOVIE' = filme
+    -- (que não tem temporada nem episódio: entra como S01E01). Entra na chave
     -- porque a abertura da 2ª temporada NÃO é o episódio 1 dela: sem esta
     -- coluna as duas dividiam a mesma linha e uma apagava os shots da outra.
     kind TEXT NOT NULL DEFAULT '',

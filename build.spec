@@ -38,34 +38,23 @@ hidden += [
     "yaml",
 ]
 
-# --- QtMultimedia (preview de vídeo embutido + áudio no hover) --------------
-# O import é feito sob try/except em preview_panel.py/character_grid.py e o
-# PyInstaller não tem hook próprio pro QtMultimedia — então coletamos à mão o
-# que ele deixaria de fora: os plugins de mídia e o backend FFmpeg do Qt.
-# hiddenimports garante que os módulos entrem; os binaries garantem os plugins.
-# Sem isto o app roda, mas cai no fallback (player externo, sem preview/hover).
-import glob as _glob
-import os as _os
-
-import PySide6 as _ps6
-
-_ps6_base = _os.path.dirname(_ps6.__file__)
+# --- Sem Qt no pacote ------------------------------------------------------
+# Este executável é o BACKEND do app Electron: ele sempre é chamado com
+# `--headless` e fala JSON-lines. A interface Qt (`app/ui`, `app/main.py`,
+# `app/updater.py`) continua no repositório e roda do código, mas dentro do
+# pacote ela é inalcançável — nenhum atalho aponta pra ela.
+#
+# Ela custava 114 MB empacotada, mais os plugins de multimídia que este bloco
+# coletava à mão pro preview de vídeo do Qt. O preview de hoje é o <video> do
+# Chromium, do lado do Electron.
+#
+# Verificado antes de cortar: dos 40 módulos que o `app.headless` alcança,
+# NENHUM importa PySide6.
 binaries = []
-# ffmpegmediaplugin.dll / windowsmediaplugin.dll -> PySide6/plugins/multimedia
-for _dll in _glob.glob(_os.path.join(_ps6_base, "plugins", "multimedia", "*.dll")):
-    binaries.append((_dll, "PySide6/plugins/multimedia"))
-# Backend FFmpeg do Qt (avcodec/avformat/avutil/swresample/swscale) + DLLs core
-# do multimedia -> raiz PySide6/
-for _pat in ("av*.dll", "sw*.dll", "Qt6Multimedia*.dll"):
-    for _dll in _glob.glob(_os.path.join(_ps6_base, _pat)):
-        binaries.append((_dll, "PySide6"))
 
 hidden += [
-    "PySide6.QtMultimedia",
-    "PySide6.QtMultimediaWidgets",
-    "PySide6.QtNetwork",   # dependência do QtMultimedia (streaming/rede)
-    # CCIP: importado tarde (só quando há decisão apertada pra conferir), e
-    # import tardio é justamente o que o PyInstaller não enxerga sozinho.
+    # CCIP e reconhecimento facial (live action): importados tarde, e import
+    # tardio é justamente o que o PyInstaller não enxerga sozinho.
     "onnxruntime",
     "onnxruntime.capi._pybind_state",
 ]
@@ -118,6 +107,16 @@ a = Analysis(
         "tkinter",
         "matplotlib.tests",
         "notebook",
+        # A interface Qt não vive dentro do pacote — ver o bloco acima.
+        "PySide6",
+        "shiboken6",
+        # O `ultralytics` arrasta o polars (176 MB!) por causa do TREINO: ele
+        # o usa pra ler results.csv e montar tabela de benchmark. Aqui só se
+        # faz inferência (`model.predict`), e nenhum arquivo do app importa
+        # polars — conferido.
+        "polars",
+        "_polars_runtime_32",
+        "_polars_runtime_64",
     ],
     noarchive=False,
 )

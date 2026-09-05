@@ -1353,6 +1353,11 @@ def _apply_request_to_config(cfg: Any, req: dict[str, Any]) -> None:
         cfg.credit_edge_threshold = float(params["credit"])
     cfg.skip_credit_shots = bool(req.get("skipCreditShots", False))
     cfg.use_danbooru = bool(req.get("useDanbooru", False))
+    # Tipo de mídia: escolhe o par de modelos que olha o rosto. Valor
+    # desconhecido cai em "anime" — o app nasceu assim e é o que não surpreende
+    # quem nunca mexeu nisso.
+    tipo = str(req.get("mediaKind", cfg.media_kind))
+    cfg.media_kind = tipo if tipo in ("anime", "live") else "anime"
     mode = str(req.get("renderExportMode", "off"))
     # Valor desconhecido cai em "off" de propósito: um modo inventado não pode
     # virar formato de saída silencioso.
@@ -1404,7 +1409,11 @@ def _run() -> int:
         skip_tail_seconds=float(req.get("skipTailSeconds", 0)),
         # Tipo inventado vira episódio, pela mesma razão do render_export_mode:
         # um valor desconhecido não pode virar identidade em silêncio.
-        kind=str(req.get("kind", "")).upper() if req.get("kind") in ("OP", "ED") else "",
+        kind=(
+            str(req.get("kind", "")).upper()
+            if req.get("kind") in ("OP", "ED", "MOVIE")
+            else ""
+        ),
         output_folder=str(req.get("outputFolder", "") or ""),
     )
 

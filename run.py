@@ -55,7 +55,18 @@ def _run() -> int:
         from app.headless import main as headless_main
         return headless_main(argv)
 
-    from app.main import main
+    # A interface Qt não vai no pacote (ver build.spec): este executável é o
+    # backend do app Electron. Do código-fonte ela roda normalmente.
+    try:
+        from app.main import main
+    except ImportError:
+        print(
+            "Este executável é o MOTOR do AnCut HUB, não o app.\n"
+            "Abra o 'AnCut HUB' pelo atalho do menu Iniciar.\n"
+            "(Pra usá-lo como backend: CorteCenas.exe --headless <modo>)",
+            file=sys.stderr,
+        )
+        return 2
     return main()
 
 
