@@ -93,8 +93,21 @@ class AniListClient:
         r = self.client.post(ANILIST_URL, json={"query": query, "variables": variables})
         if r.status_code == 404:
             return None
-        if r.status_code >= 500:
-            raise RuntimeError(f"AniList indisponível (HTTP {r.status_code}).")
+        # Fonte FORA DO AR é diferente de "não achei esse anime" — e só uma
+        # das duas merece "confira o nome que você digitou".
+        #
+        # Em setembro de 2026 a AniList desligou a API e passou a responder
+        # **403 com `errors` e `data: null`** ("temporarily disabled"). Isso
+        # caía no `return None` lá embaixo e virava "AniList sem resultado":
+        # o app dizia que o anime não existe enquanto a fonte inteira estava
+        # desligada, e o Modo Descoberta seguia sem sugerir nome nenhum sem
+        # explicar por quê. 401/429 têm a mesma natureza (chave/limite), não
+        # a de "não encontrado".
+        if r.status_code >= 500 or r.status_code in (401, 403, 429):
+            raise RuntimeError(
+                f"AniList indisponível (HTTP {r.status_code})"
+                f"{_detalhe_do_erro(r)}."
+            )
         try:
             data = r.json()
         except Exception as e:
@@ -161,3 +174,18 @@ class AniListClient:
                 break
             page += 1
         return chars
+
+
+def _detalhe_do_erro(r: "httpx.Response") -> str:
+    """A frase que a própria AniList mandou, quando ela mandou uma.
+
+    Vale repetir no lugar de inventar: foi assim que o "temporarily disabled
+    due to severe stability issues" chegou até o usuário em vez de um número
+    de HTTP solto.
+    """
+    try:
+        erros = r.json().get("errors") or []
+        msg = str(erros[0].get("message") or "").strip()
+    except Exception:
+        return ""
+    return f": {msg}" if msg else ""

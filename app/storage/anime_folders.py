@@ -51,6 +51,71 @@ _SUFIXO_TEMPORADA = re.compile(
 )
 
 
+def base_do_nome(typed: str) -> str:
+    """A chave normalizada de um nome digitado. Mesma regra do
+    `AnimeProvider._atalho_chave`: os dois leem o MESMO arquivo."""
+    return re.sub(r"[^a-z0-9]+", " ", (typed or "").lower()).strip()
+
+
+def resolver_franquia(dados: dict, typed: str, season: int) -> str:
+    """A franquia deste nome, dentro do que o cache de buscas já respondeu.
+
+    Só serve pra nome que ele já analisou antes — grafia inédita não tem
+    resposta local, e aí não há o que fazer sem consultar a fonte.
+    """
+    if not isinstance(dados, dict):
+        return ""
+    base = base_do_nome(typed)
+    if not base:
+        return ""
+    valor = dados.get(f"{base}|s{season}")
+    if isinstance(valor, str) and valor:
+        return valor
+    # Sem a temporada exata, qualquer uma serve: a franquia é a mesma.
+    por_base: dict[str, str] = {}
+    for chave, v in dados.items():
+        if isinstance(v, str) and v:
+            por_base.setdefault(str(chave).split("|")[0], v)
+    if base in por_base:
+        return por_base[base]
+
+    # Marcador de temporada no fim não muda a franquia.
+    #
+    # Os arquivos de fansub trazem isso o tempo todo — "Re Zero kara
+    # Hajimeru Isekai Seikatsu 4th Season" é o mesmo anime que "Re Zero
+    # kara Hajimeru Isekai Seikatsu", que é o que está guardado. Sem
+    # aparar, toda temporada nova chega como anime desconhecido.
+    aparado = base
+    while True:
+        novo = _SUFIXO_TEMPORADA.sub("", aparado).strip()
+        if novo == aparado or not novo:
+            break
+        aparado = novo
+        if aparado in por_base:
+            return por_base[aparado]
+
+    # Último recurso: SUBTÍTULO a mais (ou a menos).
+    #
+    # "Mushoku Tensei Jobless Reincarnation" é o mesmo anime que "Mushoku
+    # Tensei", que é o que estava guardado — e sem esta regra ele chegava
+    # como anime desconhecido: pasta nova, personagens zerados e nenhuma
+    # sugestão de nome no batismo, tudo por causa de duas palavras a mais no
+    # nome do arquivo. Um dos dois tem que ser o começo do outro, em palavra
+    # inteira; entre vários, vence o mais específico.
+    #
+    # Só quando a fonte online não respondeu: com rede, a identidade de
+    # verdade decide, e ela sempre vence este palpite.
+    candidatos = [
+        b for b in por_base
+        # 5 caracteres é o piso que impede um prefixo curto e genérico
+        # ("one", "re") de sequestrar franquia alheia.
+        if len(b) >= 5 and (base.startswith(b + " ") or b.startswith(base + " "))
+    ]
+    if candidatos:
+        return por_base[max(candidatos, key=len)]
+    return ""
+
+
 class AnimeFolderStore:
     """Arquivo em `<cache>/pastas_de_anime.json`."""
 
@@ -95,45 +160,14 @@ class AnimeFolderStore:
         vez — exatamente o par que falta aqui: nome digitado → franquia. Ler
         dele é o que permite os modos offline ("Só cortar") saberem a
         identidade sem tocar na rede.
-
-        Só serve pra nome que ele já analisou antes. Grafia nova continua sem
-        resposta, e aí não há o que fazer sem consultar a fonte.
         """
         atalho = Path(cache_root) / "anime_db" / "busca_resolvida.json"
         try:
             dados = json.loads(atalho.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return ""
-        if not isinstance(dados, dict):
-            return ""
-        # Mesma regra de chave do AnimeProvider._atalho_chave.
-        base = re.sub(r"[^a-z0-9]+", " ", (typed or "").lower()).strip()
-        valor = dados.get(f"{base}|s{season}")
-        if isinstance(valor, str) and valor:
-            return valor
-        # Sem a temporada exata, qualquer uma serve: a franquia é a mesma.
-        por_base = {}
-        for chave, v in dados.items():
-            if isinstance(v, str) and v:
-                por_base.setdefault(str(chave).split("|")[0], v)
-        if base in por_base:
-            return por_base[base]
+        return resolver_franquia(dados, typed, season)
 
-        # Marcador de temporada no fim não muda a franquia.
-        #
-        # Os arquivos de fansub trazem isso o tempo todo — "Re Zero kara
-        # Hajimeru Isekai Seikatsu 4th Season" é o mesmo anime que "Re Zero
-        # kara Hajimeru Isekai Seikatsu", que é o que está guardado. Sem
-        # aparar, toda temporada nova chega como anime desconhecido.
-        aparado = base
-        while True:
-            novo = _SUFIXO_TEMPORADA.sub("", aparado).strip()
-            if novo == aparado or not novo:
-                break
-            aparado = novo
-            if aparado in por_base:
-                return por_base[aparado]
-        return ""
 
     def decide(
         self, *, typed: str, explicit: str = "", franchise_key: str = ""

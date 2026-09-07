@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Callable
 
 from ..pipeline_types import AnimeNotFoundError
+from ..storage.anime_folders import resolver_franquia
 from .anilist import AniListAnime, AniListClient, AniListRelation
 from .danbooru import DanbooruClient, character_tag_candidates
 from .jikan import JikanClient
@@ -278,12 +279,23 @@ class AnimeProvider:
         return f"{re.sub(r'[^a-z0-9]+', ' ', anime_name.lower()).strip()}|s{season}"
 
     def _atalho_ler(self, anime_name: str, season: int) -> str | None:
+        """O banco já baixado deste nome, quando ele existe no disco.
+
+        A chave exata primeiro; depois o mesmo casamento tolerante que decide
+        a pasta (`resolver_franquia`), porque as duas memórias saem do MESMO
+        arquivo e discordar entre elas é como o episódio ia parar numa pasta
+        e o banco de personagens em outra. É o que faz "Mushoku Tensei
+        Jobless Reincarnation" reaproveitar o banco de "Mushoku Tensei" — e
+        o que mantém a análise de pé com a fonte fora do ar.
+        """
         try:
             dados = json.loads(self._atalho_path().read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return None
         valor = dados.get(self._atalho_chave(anime_name, season))
-        return valor if isinstance(valor, str) else None
+        if isinstance(valor, str) and valor:
+            return valor
+        return resolver_franquia(dados, anime_name, season) or None
 
     def _atalho_gravar(self, anime_name: str, season: int, cache_id: str) -> None:
         caminho = self._atalho_path()
@@ -446,19 +458,29 @@ class AnimeProvider:
                     )
                     local.cache_id_override = local_cache_id(anime_name)
                     return local
-                mal_down = (
-                    "\n\n⚠️ Detalhe importante: o MyAnimeList não respondeu "
-                    "(erro de servidor) durante a busca — pode ser só "
-                    "instabilidade da fonte. Vale tentar de novo em alguns "
-                    "minutos."
-                    if self.jikan.failures > fails_pre_search
+                # "Confira o nome que você digitou" é conselho ruim quando
+                # o problema é a fonte estar fora do ar — e as duas caem
+                # juntas mais do que parece (set/2026: a AniList desligou a
+                # API e o MyAnimeList devolvia 504). Dizer QUAL delas falhou
+                # é o que separa "erro meu" de "espera passar".
+                fora = []
+                if anilist_error is not None:
+                    fora.append(str(anilist_error).rstrip("."))
+                if self.jikan.failures > fails_pre_search:
+                    fora.append("MyAnimeList não respondeu (erro de servidor)")
+                fonte_fora = (
+                    "\n\n⚠️ Detalhe importante: "
+                    + "; ".join(fora)
+                    + ". Pode ser instabilidade da fonte, não o nome que "
+                    "você digitou — vale tentar de novo mais tarde."
+                    if fora
                     else ""
                 )
                 raise AnimeNotFoundError(
                     f"Anime '{anime_name}' não foi encontrado na AniList nem no "
                     "MyAnimeList. Verifique o nome (sem tags de fansub ou "
                     "qualidade) — ou use o Modo Descoberta pra identificar os "
-                    "personagens pelo próprio episódio." + mal_down
+                    "personagens pelo próprio episódio." + fonte_fora
                 )
             # Fake an AniListAnime so the rest of the flow keeps working. We
             # use the MAL id for anilist_id too — cache paths will look like

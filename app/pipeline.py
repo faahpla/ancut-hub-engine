@@ -1690,6 +1690,9 @@ class Pipeline:
             provider.close()
 
         known_centroids: list[tuple[str, np.ndarray]] = []
+        # Nomes pro autocompletar da tela de batismo quando não há elenco
+        # online — vêm do próprio banco deste anime.
+        roster_local: list[str] = []
         if online_bundle is not None:
             anime_title = online_bundle.title
             anime_id = self.db.upsert_anime(
@@ -1721,7 +1724,26 @@ class Pipeline:
                 anilist_id=None, mal_id=None, title=info.anime, title_english=None
             )
             disc_cache_id = local_cache_id(info.anime)
-            cb("fetch_characters", 1.0, "Modo Descoberta — sem banco online")
+            # Fonte fora do ar não apaga o que já está no disco.
+            #
+            # Se este anime já foi analisado alguma vez, os personagens dele
+            # estão no banco COM centroide — e é exatamente o que a sugestão
+            # de nome precisa. Sem isto, no dia em que a AniList desligou a
+            # API a tela de batismo veio com 25 campos vazios de um anime que
+            # tinha 49 personagens conhecidos aqui do lado.
+            for row in self.db.get_characters_for_anime(anime_id):
+                nome_ = (row.get("name") or "").strip()
+                if not nome_:
+                    continue
+                roster_local.append(nome_)
+                if row.get("embedding"):
+                    known_centroids.append((nome_, from_bytes(row["embedding"])))
+            if roster_local:
+                cb("fetch_characters", 1.0,
+                   f"Sem fonte online — usando os {len(roster_local)} "
+                   "personagens já conhecidos deste anime")
+            else:
+                cb("fetch_characters", 1.0, "Modo Descoberta — sem banco online")
 
         # Refs pra SUGESTÃO: quando o anime é conhecido mas nunca foi
         # analisado (sem centroides no DB), até 1 foto por personagem —
@@ -1950,7 +1972,7 @@ class Pipeline:
             online=online_bundle is not None,
             roster=(
                 [ch.name for ch in online_bundle.characters]
-                if online_bundle is not None else []
+                if online_bundle is not None else roster_local
             ),
         )
 
