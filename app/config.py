@@ -89,7 +89,14 @@ class Config:
     models_dir: str = str(DEFAULT_MODELS)
 
     # Shot detection
-    scene_threshold: float = 27.0
+    #: Piso absoluto de diferença entre quadros. NÃO é mais o gatilho do
+    #: corte (ver `shot_detection.detect_shots`): existe só pra barrar ruído
+    #: em cena parada. Quem dispara o corte é a comparação com a vizinhança.
+    scene_min_content: float = 15.0
+    #: Quantas vezes acima da média móvel a diferença precisa estar pra virar
+    #: corte. É isto que enxerga corte em cena escura, onde o limiar fixo de
+    #: antes (27) não chegava nunca.
+    scene_adaptive_ratio: float = 3.0
     min_shot_seconds: float = 0.6
 
     # Cutting

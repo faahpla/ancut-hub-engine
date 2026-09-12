@@ -57,7 +57,7 @@ from .providers.anime_provider import (
     local_cache_id,
 )
 from .references.reference_store import ReferenceStore
-from .shot_detection import ShotBounds, detect_shots
+from .shot_detection import DETECTOR_ID, ShotBounds, detect_shots
 from .storage.db import Database
 from .storage.metadata_writer import build_shot_payload, write_characters_json, write_shots_json
 from .storage.anime_folders import AnimeFolderStore
@@ -2151,10 +2151,16 @@ class Pipeline:
         if bounds_cache.exists():
             try:
                 data = json.loads(bounds_cache.read_text(encoding="utf-8"))
+                # `detector` entrou junto com a detecção adaptativa. Cache
+                # gravado antes disso não tem a chave, não bate com o
+                # DETECTOR_ID de hoje, e é recomputado — que é exatamente o
+                # que precisa acontecer: senão a reanálise de um episódio
+                # antigo reusaria os cortes ruins e nada mudaria.
                 if (
                     isinstance(data, dict)
                     and data.get("source") == str(info.source)
-                    and abs(float(data.get("threshold", -1)) - cfg.scene_threshold) < 1e-6
+                    and data.get("detector") == DETECTOR_ID
+                    and abs(float(data.get("min_seconds", -1)) - cfg.min_shot_seconds) < 1e-6
                 ):
                     shots = [
                         ShotBounds(idx=int(s["idx"]), start=float(s["start"]), end=float(s["end"]))
@@ -2170,7 +2176,8 @@ class Pipeline:
             cb("detect_shots", -1.0, "Analisando mudanças de cena...")
             shots = detect_shots(
                 info.source,
-                threshold=cfg.scene_threshold,
+                min_content_val=cfg.scene_min_content,
+                adaptive_ratio=cfg.scene_adaptive_ratio,
                 min_seconds=cfg.min_shot_seconds,
                 on_progress=lambda f: cb(
                     "detect_shots", f, f"Analisando mudanças de cena... {int(f * 100)}%"
@@ -2180,7 +2187,7 @@ class Pipeline:
                 json.dumps(
                     {
                         "source": str(info.source),
-                        "threshold": cfg.scene_threshold,
+                        "detector": DETECTOR_ID,
                         "min_seconds": cfg.min_shot_seconds,
                         "shots": [
                             {"idx": s.idx, "start": s.start, "end": s.end} for s in shots

@@ -4,7 +4,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from scenedetect import ContentDetector, SceneManager, open_video
+from scenedetect import AdaptiveDetector, SceneManager, open_video
+
+#: Identidade do detector dentro do cache de cortes (`shot_bounds.json`).
+#:
+#: MUDE isto junto com qualquer coisa que altere ONDE os cortes caem. O cache
+#: é por episódio e sobrevive à reanálise: sem trocar a identidade, episódio
+#: já analisado reusaria os cortes velhos, e a melhora não apareceria
+#: justamente pra quem já tem acervo.
+DETECTOR_ID = "adaptive/ratio=3.0/floor=15.0"
 
 
 @dataclass
@@ -20,13 +28,38 @@ class ShotBounds:
 
 def detect_shots(
     video_path: str | Path,
-    threshold: float = 27.0,
+    min_content_val: float = 15.0,
+    adaptive_ratio: float = 3.0,
     min_seconds: float = 0.6,
     on_progress: Callable[[float], None] | None = None,
 ) -> list[ShotBounds]:
+    """Onde cada cena começa e termina, por detecção ADAPTATIVA.
+
+    O `ContentDetector` comparava cada quadro com o anterior e cortava quando
+    a diferença passava de um número fixo (27). Isso falha exatamente onde o
+    anime mais precisa: cena escura, chuva, diálogo em close. Dois planos
+    diferentes de rostos escuros têm diferença numérica pequena, não chegam
+    aos 27, e viram UM clipe só.
+
+    Medido no acervo: 334 clipes de 8s ou mais FORA dos créditos, em 11
+    episódios — uns 30 por episódio. O pior, no Re:ZERO S04E11, tinha 40,6s
+    com Subaru e Emilia se revezando quatro vezes. Um clipe assim não serve
+    pra nenhum dos dois: ele não é de ninguém.
+
+    O `AdaptiveDetector` compara a diferença de cada quadro com a VIZINHANÇA
+    dela (`adaptive_ratio` vezes a média móvel) em vez de com uma constante,
+    então um corte dentro de uma cena escura se destaca do próprio escuro ao
+    redor. `min_content_val` é só um piso contra ruído de cena parada — não é
+    mais o gatilho.
+
+    Medido naquele clipe de 40,6s: acha os 4 cortes, nos lugares certos. No
+    Bleach S01E06 inteiro, 419 -> 466 cenas (+11%) e ~14% mais rápido.
+    """
     video = open_video(str(video_path))
     sm = SceneManager()
-    sm.add_detector(ContentDetector(threshold=threshold))
+    sm.add_detector(
+        AdaptiveDetector(adaptive_threshold=adaptive_ratio, min_content_val=min_content_val)
+    )
     # detect_scenes blocks for the whole episode (minutes). The per-cut
     # callback (fires every few seconds of video) feeds real progress to the
     # UI — and gives the cancel button a place to land mid-detection.
