@@ -12,7 +12,7 @@ from scenedetect import AdaptiveDetector, SceneManager, open_video
 #: é por episódio e sobrevive à reanálise: sem trocar a identidade, episódio
 #: já analisado reusaria os cortes velhos, e a melhora não apareceria
 #: justamente pra quem já tem acervo.
-DETECTOR_ID = "adaptive/ratio=3.0/floor=15.0"
+DETECTOR_ID = "adaptive/ratio=2.0/floor=15.0/curta-cola"
 
 
 @dataclass
@@ -29,7 +29,7 @@ class ShotBounds:
 def detect_shots(
     video_path: str | Path,
     min_content_val: float = 15.0,
-    adaptive_ratio: float = 3.0,
+    adaptive_ratio: float = 2.0,
     min_seconds: float = 0.6,
     on_progress: Callable[[float], None] | None = None,
 ) -> list[ShotBounds]:
@@ -54,6 +54,17 @@ def detect_shots(
 
     Medido naquele clipe de 40,6s: acha os 4 cortes, nos lugares certos. No
     Bleach S01E06 inteiro, 419 -> 466 cenas (+11%) e ~14% mais rápido.
+
+    **A razão 3,0 original tinha o defeito espelhado.** Comparar com a
+    vizinhança falha quando a vizinhança inteira já está agitada: numa
+    batalha de magia — flash, raio, tela piscando — nenhum corte chega a ser
+    3x a média, porque a média já é enorme. Medido num clipe do Slime
+    S04E23 com ~9 cenas em 10,3s: razão 3,0 achou ZERO cortes (o
+    ContentDetector antigo achava 1, e mesmo assim errava). A 2,0 acha 6.
+
+    2,0 e não menos: a 1,5 acha os 12 do mesmo clipe, mas o episódio inteiro
+    ganha só 5% de cenas e o dobro de fragmentos curtos. Vale medir de novo
+    num episódio de ação antes de descer mais.
     """
     video = open_video(str(video_path))
     sm = SceneManager()
@@ -76,15 +87,22 @@ def detect_shots(
     sm.detect_scenes(video, show_progress=False, callback=callback)
     scenes = sm.get_scene_list()
 
+    # Cena curta demais COLA na anterior, não some.
+    #
+    # Antes era `continue`: o trecho saía da lista e nenhum clipe cobria
+    # aqueles segundos — episódio perdido em silêncio. Passava despercebido
+    # porque eram poucos (11 num episódio), mas é o que impedia subir a
+    # sensibilidade: com `adaptive_ratio` menor os fragmentos passam de 100, e
+    # aí o buraco deixa de ser detalhe. Colando, ficar mais sensível não custa
+    # mais material nenhum.
     shots: list[ShotBounds] = []
-    idx = 0
     for s, e in scenes:
         start = s.get_seconds()
         end = e.get_seconds()
-        if end - start < min_seconds:
+        if end - start < min_seconds and shots:
+            shots[-1].end = end
             continue
-        shots.append(ShotBounds(idx=idx, start=start, end=end))
-        idx += 1
+        shots.append(ShotBounds(idx=len(shots), start=start, end=end))
 
     if not shots:
         # fallback: whole video as one shot

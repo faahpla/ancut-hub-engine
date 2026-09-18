@@ -96,7 +96,10 @@ class Config:
     #: Quantas vezes acima da média móvel a diferença precisa estar pra virar
     #: corte. É isto que enxerga corte em cena escura, onde o limiar fixo de
     #: antes (27) não chegava nunca.
-    scene_adaptive_ratio: float = 3.0
+    #:
+    #: Começou em 3,0 e desceu pra 2,0: em cena de ação piscando, a média já é
+    #: enorme e nenhum corte chega a 3x ela. Ver `shot_detection.detect_shots`.
+    scene_adaptive_ratio: float = 2.0
     min_shot_seconds: float = 0.6
 
     # Cutting
