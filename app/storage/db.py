@@ -251,7 +251,27 @@ class Database:
         episode: int,
         source: str,
         kind: str = "",
+        root: str | None = None,
     ) -> int:
+        """A linha deste episódio — reaproveitada quando já existe.
+
+        A identidade é (anime, temporada, episódio, tipo), mas o ANIME não é
+        estável entre os modos: "Só cortar" não usa rede e registra pelo nome
+        do arquivo ("That Time I Got Reincarnated as a Slime"); identificar
+        depois resolve no AniList e registra pelo nome oficial ("Tensei
+        Shitara Slime Datta Ken 4th Season"). Anime diferente, chave
+        diferente, linha NOVA — duas entradas no histórico apontando pra
+        mesma pasta. Aconteceu com o Slime S04E24 cortado pela fila.
+
+        E duplicata aqui não é só feiura: excluir qualquer uma das duas pela
+        Biblioteca apaga a pasta, e a pasta é das duas.
+
+        Então `root` entra como segunda identidade: uma pasta no disco é UM
+        episódio. Achando uma linha dessa pasta sob outro anime, ela é
+        reaproveitada — e se ela era do anime sem rede e este tem id do
+        AniList, passa a ser deste. Nunca o contrário: cortar de novo, sem
+        rede, um episódio já identificado não pode rebaixar a identidade dele.
+        """
         with self.connect() as c:
             row = c.execute(
                 "SELECT id FROM episode "
@@ -264,6 +284,36 @@ class Database:
                     (source, row["id"]),
                 )
                 return row["id"]
+            if root:
+                mesma_pasta = c.execute(
+                    "SELECT e.id, a.anilist_id FROM episode e "
+                    "LEFT JOIN anime a ON a.id = e.anime_id "
+                    "WHERE lower(e.output_root) = lower(?) "
+                    "AND e.season=? AND e.episode=? AND e.kind=?",
+                    (root, season, episode, kind),
+                ).fetchone()
+                if mesma_pasta:
+                    este = c.execute(
+                        "SELECT anilist_id FROM anime WHERE id=?", (anime_id,)
+                    ).fetchone()
+                    sobe = (
+                        este is not None
+                        and este["anilist_id"] is not None
+                        and mesma_pasta["anilist_id"] is None
+                    )
+                    if sobe:
+                        c.execute(
+                            "UPDATE episode SET anime_id=?, source_file=?, "
+                            "processed_at=CURRENT_TIMESTAMP WHERE id=?",
+                            (anime_id, source, mesma_pasta["id"]),
+                        )
+                    else:
+                        c.execute(
+                            "UPDATE episode SET source_file=?, "
+                            "processed_at=CURRENT_TIMESTAMP WHERE id=?",
+                            (source, mesma_pasta["id"]),
+                        )
+                    return mesma_pasta["id"]
             cur = c.execute(
                 "INSERT INTO episode(anime_id, season, episode, source_file, "
                 "processed_at, kind) VALUES(?,?,?,?,CURRENT_TIMESTAMP,?)",

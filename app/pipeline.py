@@ -256,7 +256,8 @@ class Pipeline:
             title_english=bundle.title_english,
         )
         episode_id = self.db.upsert_episode(
-            anime_id, info.season, info.episode, str(info.source), info.kind
+            anime_id, info.season, info.episode, str(info.source), info.kind,
+            root=str(episode_root),
         )
         # Guarda a pasta de saída real: é o que permite reabrir este resultado
         # depois sem reanalisar (reconstruir o caminho dependia do nome que o
@@ -1580,7 +1581,8 @@ class Pipeline:
 
         anime_id = self.db.upsert_anime(anilist_id=None, title=info.anime)
         episode_id = self.db.upsert_episode(
-            anime_id, info.season, info.episode, str(info.source), info.kind
+            anime_id, info.season, info.episode, str(info.source), info.kind,
+            root=str(episode_root),
         )
         self.db.set_episode_root(episode_id, str(episode_root))
         self.db.clear_episode_shots(episode_id)
@@ -1787,7 +1789,8 @@ class Pipeline:
         cb("embed_refs", 1.0, "Modelos prontos")
 
         episode_id = self.db.upsert_episode(
-            anime_id, info.season, info.episode, str(info.source), info.kind
+            anime_id, info.season, info.episode, str(info.source), info.kind,
+            root=str(episode_root),
         )
         # Gravar a pasta AQUI, e não só no commit: sem isto uma descoberta
         # abandonada (ou que ainda não foi batizada) deixava output_root NULL,
