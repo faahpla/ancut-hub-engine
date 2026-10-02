@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import sys
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
@@ -116,6 +117,71 @@ class Database:
         with self.connect() as c:
             c.executescript(SCHEMA)
             self._migrate(c)
+            self._limpar_duplicatas(c)
+
+    @staticmethod
+    def _limpar_duplicatas(c: sqlite3.Connection) -> None:
+        """Apaga a cópia vazia que motor anterior ao 0.14.1 deixou no histórico.
+
+        Cortar (sem rede, anime pelo nome do arquivo) e identificar depois
+        (com rede, anime pelo nome do AniList) criava duas linhas pra mesma
+        pasta. O 0.14.1 parou de criar; esta limpeza some com as que ficaram
+        — inclusive no PC de quem só instala a versão nova, sem ninguém
+        precisar mexer no banco à mão.
+
+        Só apaga quando é inequívoco:
+
+        - a mesma pasta, temporada, episódio e tipo têm UMA linha de anime com
+          id do AniList — é ela que fica;
+        - a que sai é de anime sem id do AniList;
+        - e está vazia de trabalho humano: nenhum personagem marcado, nenhum
+          favorito, nenhuma curadoria manual. Uma cópia em que alguém mexeu
+          não é cópia, e fica.
+
+        Só linhas do banco. A pasta e os clipes são das duas, e não são
+        tocados.
+        """
+        grupos = c.execute(
+            "SELECT lower(e.output_root) AS pasta, e.season, e.episode, e.kind "
+            "FROM episode e WHERE e.output_root IS NOT NULL "
+            "GROUP BY lower(e.output_root), e.season, e.episode, e.kind "
+            "HAVING count(*) > 1"
+        ).fetchall()
+        for g in grupos:
+            linhas = c.execute(
+                "SELECT e.id, a.anilist_id FROM episode e "
+                "LEFT JOIN anime a ON a.id = e.anime_id "
+                "WHERE lower(e.output_root)=? AND e.season=? AND e.episode=? "
+                "AND e.kind=?",
+                (g["pasta"], g["season"], g["episode"], g["kind"]),
+            ).fetchall()
+            online = [r for r in linhas if r["anilist_id"] is not None]
+            if len(online) != 1:
+                continue
+            for r in linhas:
+                if r["anilist_id"] is not None:
+                    continue
+                eid = r["id"]
+                mexido = c.execute(
+                    "SELECT "
+                    "(SELECT count(*) FROM shot_character sc JOIN shot s "
+                    "  ON s.id = sc.shot_id WHERE s.episode_id = :e) + "
+                    "(SELECT count(*) FROM favorite f JOIN shot s "
+                    "  ON s.id = f.shot_id WHERE s.episode_id = :e) + "
+                    "(SELECT count(*) FROM manual_override WHERE episode_id = :e)",
+                    {"e": eid},
+                ).fetchone()[0]
+                if mexido:
+                    continue
+                c.execute("DELETE FROM shot WHERE episode_id=?", (eid,))
+                c.execute("DELETE FROM episode WHERE id=?", (eid,))
+                print(
+                    f"[CorteCenas] Duplicata removida do histórico: episódio "
+                    f"{eid} (S{g['season']:02d}E{g['episode']:02d}, {g['pasta']}) "
+                    f"— a pasta continua, com a entrada {online[0]['id']}.",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
     @staticmethod
     def _migrate(c: sqlite3.Connection) -> None:
@@ -273,33 +339,55 @@ class Database:
         rede, um episódio já identificado não pode rebaixar a identidade dele.
         """
         with self.connect() as c:
-            row = c.execute(
-                "SELECT id FROM episode "
-                "WHERE anime_id=? AND season=? AND episode=? AND kind=?",
-                (anime_id, season, episode, kind),
-            ).fetchone()
-            if row:
-                c.execute(
-                    "UPDATE episode SET source_file=?, processed_at=CURRENT_TIMESTAMP WHERE id=?",
-                    (source, row["id"]),
-                )
-                return row["id"]
+            # A PASTA vem antes da chave (anime, temporada, episódio, tipo).
+            #
+            # Em banco que já tem a duplicata — criada por motor anterior ao
+            # 0.14.1 —, a chave do anime sem rede casa com a cópia vazia, e
+            # recortar sem rede trabalharia nela. Indo pela pasta, e com a
+            # linha de id do AniList na frente, a cópia vazia nunca é a linha
+            # em uso: é isso que deixa `_limpar_duplicatas` apagá-la a
+            # qualquer momento, até com uma análise rodando em paralelo.
+            mesma_pasta = None
             if root:
                 mesma_pasta = c.execute(
                     "SELECT e.id, a.anilist_id FROM episode e "
                     "LEFT JOIN anime a ON a.id = e.anime_id "
                     "WHERE lower(e.output_root) = lower(?) "
-                    "AND e.season=? AND e.episode=? AND e.kind=?",
+                    "AND e.season=? AND e.episode=? AND e.kind=? "
+                    "ORDER BY (a.anilist_id IS NULL), e.id",
                     (root, season, episode, kind),
                 ).fetchone()
+            if mesma_pasta is None:
+                row = c.execute(
+                    "SELECT id FROM episode "
+                    "WHERE anime_id=? AND season=? AND episode=? AND kind=?",
+                    (anime_id, season, episode, kind),
+                ).fetchone()
+                if row:
+                    c.execute(
+                        "UPDATE episode SET source_file=?, processed_at=CURRENT_TIMESTAMP WHERE id=?",
+                        (source, row["id"]),
+                    )
+                    return row["id"]
+            if root:
                 if mesma_pasta:
                     este = c.execute(
                         "SELECT anilist_id FROM anime WHERE id=?", (anime_id,)
+                    ).fetchone()
+                    # Mesmo episódio do anime online já registrado em OUTRA
+                    # pasta: subir esta violaria o UNIQUE da chave. Fica como
+                    # está — melhor uma linha sem nome oficial que um erro no
+                    # fim de uma análise de vários minutos.
+                    ocupada = c.execute(
+                        "SELECT 1 FROM episode WHERE anime_id=? AND season=? "
+                        "AND episode=? AND kind=? AND id<>?",
+                        (anime_id, season, episode, kind, mesma_pasta["id"]),
                     ).fetchone()
                     sobe = (
                         este is not None
                         and este["anilist_id"] is not None
                         and mesma_pasta["anilist_id"] is None
+                        and ocupada is None
                     )
                     if sobe:
                         c.execute(
