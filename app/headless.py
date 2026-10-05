@@ -1255,6 +1255,33 @@ def _set_season(episode_ids: list[int], season: int, aplicar_agora: bool) -> Non
     })
 
 
+def _reclassify(destino: str, season: int, itens_txt: str, aplicar_agora: bool) -> None:
+    """Muda tipo, número e pasta de anime de vários episódios de uma vez.
+
+    O caso que trouxe isto: aberturas analisadas sem marcar "Abertura", cada
+    uma virando um anime próprio com um S01E01. Ver `storage/reclassificar.py`.
+    """
+    from .config import Config
+    from .storage.anime_folders import AnimeFolderStore
+    from .storage.db import Database
+    from .storage.reclassificar import aplicar, ler_itens, planejar
+
+    cfg = Config.load()
+    db = Database(cfg.cache_path / "index.db")
+    itens = ler_itens(itens_txt)
+    plano = (aplicar if aplicar_agora else planejar)(cfg.output_dir, itens, destino, season, db)
+
+    feito = bool(aplicar_agora and plano.pode and not plano.erro)
+    if feito and destino:
+        # A memória de nomes que mandava pra pasta esvaziada passa a mandar
+        # pro destino — senão a próxima análise recria a pasta.
+        store = AnimeFolderStore(cfg.cache_path)
+        for o in plano.esvaziadas:
+            store.repoint(Path(o).name, destino)
+
+    _emit({"type": "reclassify", "aplicado": feito, **plano.payload()})
+
+
 def _merge_anime(origem: str, destino: str, aplicar: bool) -> None:
     """Junta duas pastas de anime numa só.
 
@@ -1674,6 +1701,15 @@ def main(argv: list[str] | None = None) -> int:
                 [int(x) for x in args[2].split(",") if x.strip()],
                 int(args[1]),
                 aplicar_agora=(len(args) > 3 and args[3] == "apply"),
+            )
+            return 0
+        if mode == "reclassify":
+            # reclassify <pasta-destino|""> <temporada> <id:TIPO:n,...> [apply]
+            _reclassify(
+                args[1],
+                int(args[2]),
+                args[3],
+                aplicar_agora=(len(args) > 4 and args[4] == "apply"),
             )
             return 0
         if mode == "merge-anime":

@@ -692,6 +692,26 @@ class Database:
         with self.connect() as c:
             c.execute("UPDATE episode SET season=? WHERE id=?", (season, episode_id))
 
+    def reclassify_episodes(self, mudancas: list[tuple[int, int, int, str, str]]) -> None:
+        """Novo (temporada, número, tipo, pasta) de vários episódios, numa
+        transação só.
+
+        Em dois passos: primeiro todos vão pra um número provisório (o próprio
+        id, negativo), depois pro definitivo. Direto, um episódio podia
+        tentar entrar na chave que outro da mesma lista ainda não liberou, e o
+        UNIQUE derrubava a operação no meio.
+        """
+        if not mudancas:
+            return
+        with self.connect() as c:
+            for eid, *_ in mudancas:
+                c.execute("UPDATE episode SET episode=? WHERE id=?", (-eid, eid))
+            for eid, season, numero, kind, root in mudancas:
+                c.execute(
+                    "UPDATE episode SET season=?, episode=?, kind=?, output_root=? WHERE id=?",
+                    (season, numero, kind, str(root), eid),
+                )
+
     def all_episode_roots(self) -> list[dict]:
         """Todo episódio que tem pasta gravada — `id` e `output_root`.
 
