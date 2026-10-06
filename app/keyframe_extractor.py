@@ -21,7 +21,52 @@ _NVENC_WORKERS = 3
 _CPU_WORKERS = 4
 
 
-def render_output_params(render_mode: str, use_nvenc: bool) -> dict[str, object]:
+#: HDR (PQ ou HLG, BT.2020) pra SDR BT.709, no ffmpeg.
+#:
+#: Sem isto, vídeo HDR saía DESBOTADO e puxado pro roxo — nos keyframes (o
+#: OpenCV converte os números de 10 bits pra 8 sem saber que são PQ) e nos
+#: clipes (8 bits, mas ainda marcados como BT.2020/PQ, que editor e player
+#: interpretam cada um de um jeito). Visto no Cyberpunk Edgerunners da
+#: Netflix (HEVC 10 bits, DV + HDR10). E o reconhecimento comparava esses
+#: rostos lavados com as referências em cor normal.
+#:
+#: `mobius` e não `hable`: comparado no mesmo quadro, o hable escurece o anime
+#: inteiro; o mobius preserva o que já cabia em SDR e só comprime o brilho
+#: alto. O zscale converte pra luz linear, troca as primárias, e o tonemap
+#: trabalha em float — por isso o `gbrpf32le` no meio. Custa: o clipe de 10s
+#: sai em 3,8s em vez de 1,3s (só em fonte HDR).
+_TONEMAP_VF = (
+    "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,"
+    "tonemap=tonemap=mobius:desat=0,zscale=t=bt709:m=bt709:r=tv"
+)
+
+#: Gravado ao lado dos clipes (`.cor`). Corte de fonte HDR sem esta marca foi
+#: feito antes da conversão, e é refeito — clipes e keyframes.
+COR_VERSAO = "sdr-mobius-1"
+
+
+def fonte_hdr(video_path: str | Path) -> bool:
+    """O vídeo é HDR (PQ/HDR10/Dolby Vision com base HDR10, ou HLG)?"""
+    from .ffmpeg_locate import ffprobe_binary
+
+    try:
+        r = subprocess.run(
+            [
+                ffprobe_binary(), "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=color_transfer",
+                "-of", "default=nw=1:nk=1", str(video_path),
+            ],
+            capture_output=True, text=True, timeout=30,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return r.stdout.strip() in ("smpte2084", "arib-std-b67")
+    except Exception:
+        return False
+
+
+def render_output_params(
+    render_mode: str, use_nvenc: bool, hdr: bool = False
+) -> dict[str, object]:
     """Parâmetros de saída do ffmpeg para um modo de export.
 
     FONTE ÚNICA de propósito: o corte e o merge precisam produzir exatamente o
@@ -40,6 +85,12 @@ def render_output_params(render_mode: str, use_nvenc: bool) -> dict[str, object]
     }
     if render:
         p |= {"vf": "fps=24000/1001", "fps_mode": "cfr", "profile:v": "high"}
+    if hdr:
+        # A conversão vem ANTES do fps, e o clipe sai marcado como o que ele é
+        # agora: BT.709. Sem as marcas o ffmpeg copiava as da fonte, e o
+        # clipe dizia ser HDR sem ser.
+        p["vf"] = f"{_TONEMAP_VF},format=yuv420p" + (f",{p['vf']}" if "vf" in p else "")
+        p |= {"color_primaries": "bt709", "color_trc": "bt709", "colorspace": "bt709"}
 
     if use_nvenc:
         p |= {"vcodec": "h264_nvenc", "preset": "p4"}
@@ -70,6 +121,7 @@ def cut_shot(
     use_nvenc: bool = False,
     fps: float = 24.0,
     render_mode: str = "off",
+    hdr: bool = False,
 ) -> None:
     """Extract a shot to an mp4 file. Re-encode for frame accuracy, or stream-copy for speed.
 
@@ -103,7 +155,7 @@ def cut_shot(
             str(out_file),
             t=duration,
             loglevel="error",
-            **render_output_params(render_mode, use_nvenc),
+            **render_output_params(render_mode, use_nvenc, hdr=hdr),
         )
     else:
         stream = ffmpeg.input(str(video_path), ss=shot.start, to=shot.end).output(
@@ -227,6 +279,98 @@ def extract_keyframes_batch(
     return saida
 
 
+def _soma_balanceada(quadros: list[int]) -> str:
+    """`eq(n,a)+eq(n,b)+…` em árvore: ((a+b)+(c+d)), não a+b+c+d.
+
+    O parser de expressão do ffmpeg aninha uma soma corrida em profundidade
+    linear, e com os 1443 quadros de um episódio ele desiste com "Cannot
+    allocate memory" — os keyframes saíam zerados, calados. Em árvore a
+    profundidade é log2(N), ~11.
+    """
+    if len(quadros) == 1:
+        return f"eq(n,{quadros[0]})"
+    m = len(quadros) // 2
+    return f"({_soma_balanceada(quadros[:m])}+{_soma_balanceada(quadros[m:])})"
+
+
+def extract_keyframes_hdr(
+    video_path: str | Path,
+    pedidos: list[tuple[int, list[int]]],
+    out_dir: Path,
+) -> dict[int, list[Path]]:
+    """`extract_keyframes_batch` pra fonte HDR: os MESMOS quadros, com cor.
+
+    O OpenCV entrega o HDR desbotado e não tem como converter direito — ele
+    já perdeu a informação quando reduziu pra 8 bits. Aqui o ffmpeg lê o
+    vídeo uma vez, o `select` deixa passar só os quadros pedidos, e só esses
+    passam pela conversão (cara) de cor. Medido: o número do quadro bate com
+    o do OpenCV (`n` do select = CAP_PROP_POS_FRAMES).
+
+    A lista de quadros vai num arquivo (`-/vf`): com 1500 quadros o filtro
+    passa de 18 mil caracteres, perto do limite da linha de comando do
+    Windows.
+    """
+    import shutil
+    import tempfile
+
+    from .ffmpeg_locate import ffmpeg_binary
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    saida: dict[int, list[Path]] = {}
+    alvos = sorted({f for _, frames in pedidos for f in frames})
+    if not alvos:
+        return saida
+
+    with tempfile.TemporaryDirectory(prefix="ancut-kf-") as tmp:
+        tmpd = Path(tmp)
+        script = tmpd / "vf.txt"
+        select = _soma_balanceada(alvos)
+        script.write_text(
+            f"select='{select}',{_TONEMAP_VF},format=yuvj420p", encoding="ascii"
+        )
+        base = [ffmpeg_binary(), "-v", "error", "-y"]
+        resto = [
+            "-i", str(video_path), "-an", "-sn", "-dn",
+            "-/vf", str(script), "-fps_mode", "passthrough",
+            "-q:v", "2", "-f", "image2", str(tmpd / "q_%06d.jpg"),
+        ]
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        # A GPU decodifica o HEVC de 10 bits mais rápido (19s → 14s em 5 min
+        # de vídeo); sem ela, ou se falhar, a CPU faz o mesmo trabalho.
+        r = subprocess.run(base + ["-hwaccel", "cuda"] + resto,
+                           capture_output=True, creationflags=flags)
+        saidos = sorted(tmpd.glob("q_*.jpg"))
+        if r.returncode != 0 or len(saidos) != len(alvos):
+            for f in saidos:
+                f.unlink(missing_ok=True)
+            r = subprocess.run(base + resto, capture_output=True, creationflags=flags)
+            saidos = sorted(tmpd.glob("q_*.jpg"))
+        if not saidos:
+            # Sem isto a falha era calada: episódio sem keyframe nenhum, e a
+            # descoberta respondendo "0 rostos" sem dizer por quê.
+            print(
+                "[CorteCenas] keyframes HDR falharam: "
+                + r.stderr.decode("utf-8", "replace").strip()[-300:],
+                flush=True,
+            )
+        # O select solta os quadros em ordem: o i-ésimo arquivo é o i-ésimo
+        # quadro pedido. Se veio um número diferente (fim de arquivo antes do
+        # último), casa até onde dá.
+        por_quadro = dict(zip(alvos, saidos))
+        for idx, frames in pedidos:
+            for k, f in enumerate(frames):
+                origem = por_quadro.get(f)
+                if origem is None:
+                    continue
+                destino = out_dir / f"{idx:04d}_{k}.jpg"
+                shutil.copyfile(origem, destino)
+                saida.setdefault(idx, []).append(destino)
+
+    for lista in saida.values():
+        lista.sort()
+    return saida
+
+
 def frame_numbers_for(shot: ShotBounds, fps: float, n_frames: int) -> list[int]:
     """Quais quadros do vídeo representam esta cena. Mesma regra de sempre."""
     offsets = [0.5] if n_frames <= 1 else [
@@ -296,6 +440,31 @@ def cut_all_shots(
     except OSError:
         pass  # marcador é otimização, não pode derrubar a análise
 
+    # Fonte HDR: clipes E keyframes saem convertidos pra SDR. Corte HDR feito
+    # antes da conversão não tem a marca `.cor` e é refeito inteiro — senão o
+    # episódio já cortado continuaria desbotado pra sempre, e é justamente
+    # ele que a pessoa vai identificar depois. Fonte SDR não muda nada.
+    hdr = fonte_hdr(video_path)
+    cor_stamp = shots_dir / ".cor"
+    cor_atual = COR_VERSAO if hdr else "original"
+    try:
+        cor_antes = cor_stamp.read_text(encoding="utf-8").strip()
+    except OSError:
+        cor_antes = "original"
+    refazer_kfs = cor_antes != cor_atual
+    if refazer_kfs:
+        reuse_cuts = False
+        if any(shots_dir.glob("*.mp4")):
+            print(
+                f"[CorteCenas] Cor mudou ({cor_antes} -> {cor_atual})"
+                " - recortando clipes e keyframes",
+                flush=True,
+            )
+    try:
+        cor_stamp.write_text(cor_atual, encoding="utf-8")
+    except OSError:
+        pass
+
     # fps do vídeo, sondado uma vez: o corte usa meia duração de frame como
     # margem pra não deixar o primeiro frame do shot seguinte vazar pro clipe.
     probe = cv2.VideoCapture(str(video_path))
@@ -324,10 +493,16 @@ def cut_all_shots(
     }
     faltando = [
         s for s in shots
-        if not (skip_existing and all(
+        if refazer_kfs or not (skip_existing and all(
             p.exists() and p.stat().st_size > 0 for p in esperados[s.idx]
         ))
     ]
+    if refazer_kfs:
+        # Os de cor velha não podem ficar: `process` lá embaixo usa o que
+        # existir no disco quando a extração nova ainda não terminou.
+        for lista in esperados.values():
+            for p in lista:
+                p.unlink(missing_ok=True)
     # E roda EM PARALELO com os cortes, não antes deles: extrair keyframe é
     # decodificação na CPU, cortar clipe é codificação na GPU (NVENC). São
     # recursos diferentes, então uma espera não precisa custar a outra.
@@ -335,7 +510,7 @@ def cut_all_shots(
     kf_pool = ThreadPoolExecutor(max_workers=1) if faltando else None
     kf_future = (
         kf_pool.submit(
-            extract_keyframes_batch,
+            extract_keyframes_hdr if hdr else extract_keyframes_batch,
             video_path,
             [(s.idx, frame_numbers_for(s, video_fps, keyframes_per_shot))
              for s in faltando],
@@ -356,7 +531,7 @@ def cut_all_shots(
             try:
                 cut_shot(video_path, shot, out_file, reencode=reencode,
                          use_nvenc=enc_state["nvenc"], fps=video_fps,
-                         render_mode=render_mode)
+                         render_mode=render_mode, hdr=hdr)
             except ffmpeg.Error:
                 if enc_state["nvenc"]:
                     enc_state["nvenc"] = False
@@ -368,7 +543,7 @@ def cut_all_shots(
                     try:
                         cut_shot(video_path, shot, out_file, reencode=reencode,
                                  use_nvenc=False, fps=video_fps,
-                                 render_mode=render_mode)
+                                 render_mode=render_mode, hdr=hdr)
                     except ffmpeg.Error:
                         return None
                 else:
