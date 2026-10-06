@@ -25,6 +25,7 @@ class EmbeddingEngine:
         use_cuda: bool = True,
     ) -> None:
         self.on_device_fallback: str | None = None
+        self.model_name = model_name
         prefer_cuda = use_cuda and torch.cuda.is_available()
         self.device = torch.device("cuda" if prefer_cuda else "cpu")
 
@@ -67,6 +68,21 @@ class EmbeddingEngine:
         if not tensors:
             return np.zeros((0, self._dim()), dtype=np.float32)
         return self._forward(torch.stack(tensors))
+
+    @torch.no_grad()
+    def embed_texts(self, texts: list[str]) -> np.ndarray:
+        """Frases no MESMO espaço das imagens (L2-normalizado).
+
+        O CLIP foi treinado pra que imagem e legenda caiam perto. É o que
+        permite perguntar a um recorte "você é um rosto ou uma nuca?" sem
+        treinar nada — ver `face_clustering.probabilidade_de_rosto`.
+        """
+        if not texts:
+            return np.zeros((0, self._dim()), dtype=np.float32)
+        tokens = open_clip.get_tokenizer(self.model_name)(texts).to(self.device)
+        feats = self.model.encode_text(tokens)
+        feats = feats / feats.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        return feats.detach().cpu().numpy().astype(np.float32)
 
     @torch.no_grad()
     def _forward(self, batch: torch.Tensor) -> np.ndarray:

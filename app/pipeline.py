@@ -36,7 +36,17 @@ from .matching.feature_cache import FeatureCache
 # Lightweight types re-exported here so callers can keep `from .pipeline
 # import AIMode, PipelineResult, STAGES` without dragging in torch just to
 # read a type name. UI modules should prefer `from .pipeline_types import ...`.
-from .matching.face_clustering import FaceObservation, cluster_faces, pick_representatives
+from .matching.face_clustering import (
+    PISO_ROSTO,
+    PROMPTS_NAO_ROSTO,
+    PROMPTS_ROSTO,
+    FaceObservation,
+    cluster_faces,
+    juntar_por_nome,
+    pick_representatives,
+    probabilidade_de_rosto,
+    reconhece,
+)
 from .matching.group_rescue import decide, diverse_representatives, rank_characters
 from .matching.second_pass import ShotFaces, build_episode_banks, rescue_unassigned
 from .pipeline_types import (
@@ -111,9 +121,13 @@ def _cache_id_for(bundle) -> str:
 #: Um episódio devolve centenas de grupos (252 num Demon Slayer, com 4867
 #: rostos) e a esmagadora maioria é NPC de fundo: aparece numa cena, some.
 #: Perguntar o nome de todos eles é o que faz a tela de batismo virar uma
-#: parede. Duas cenas é o piso do que pode virar personagem recorrente — e
-#: nada é jogado fora: os de baixo continuam lá, atrás de um botão.
-_MIN_CENAS_RELEVANTE = 2
+#: parede. Nada é jogado fora: os de baixo continuam lá, atrás de um botão.
+#:
+#: Era 2 e subiu pra 3: no Apothecary S01E05, 17 dos 49 grupos tinham duas
+#: cenas ou menos, e o FAAH reclamou exatamente da "quantidade massiva de
+#: figurantes". Personagem já reconhecido de outro episódio nunca é
+#: figurante, tenha quantas cenas tiver.
+_MIN_CENAS_RELEVANTE = 3
 
 
 def _corte_agrupamento(cfg) -> float:
@@ -1079,6 +1093,7 @@ class Pipeline:
                     centroid_bytes=to_bytes(cl.centroid.astype(np.float32)),
                     suggested_name=sug,
                     suggested_sim=sug_sim,
+                    minor=len(positions) < _MIN_CENAS_RELEVANTE,
                 ))
             if groups_out:
                 leftover_result = DiscoveryResult(
@@ -1747,6 +1762,11 @@ class Pipeline:
             else:
                 cb("fetch_characters", 1.0, "Modo Descoberta — sem banco online")
 
+        # Só os centroides do BANCO — personagens batizados em outro episódio
+        # — podem dar nome sozinhos. Os provisórios lá de baixo vêm de uma ou
+        # duas fotos da internet: servem pra dica "parece X", não pra decidir.
+        do_banco = {nome for nome, _ in known_centroids}
+
         # Refs pra SUGESTÃO: quando o anime é conhecido mas nunca foi
         # analisado (sem centroides no DB), até 1 foto por personagem —
         # pouco demais pra análise — já serve pra pré-nomear grupos.
@@ -1908,14 +1928,54 @@ class Pipeline:
 
         cb("second_pass", 1.0, "—")
         cb("ai_review", 1.0, "—")
+        # Nuca, pescoço, cabelo de costas, objeto: fora ANTES de agrupar. Cada
+        # um virava um grupo pro usuário apagar — ou pior, se infiltrava num
+        # grupo de verdade e ia parar nas referências. Só no CLIP: o ArcFace
+        # do live action não entende frase, e lá o detector é outro.
+        # A nota de cada recorte que fica, pra julgar o grupo inteiro depois.
+        p_obs: np.ndarray | None = None
+        if observations and cfg.media_kind != "live":
+            textos = self._textos_rosto(get_engine)
+            embs_obs = np.stack([o.embedding for o in observations])
+            if textos is not None and textos.shape[1] == embs_obs.shape[1]:
+                p_rosto = probabilidade_de_rosto(embs_obs, textos)
+                antes = len(observations)
+                fica = p_rosto >= PISO_ROSTO
+                observations = [o for o, f in zip(observations, fica) if f]
+                p_obs = p_rosto[fica]
+                print(f"[Descoberta] {antes - len(observations)} de {antes} recortes "
+                      "não eram rosto (nuca, pescoço, objeto) — fora do agrupamento.",
+                      flush=True)
+
         cb("organize", -1.0, f"Agrupando {len(observations)} rostos por personagem...")
         clusters = cluster_faces(observations, cut=_corte_agrupamento(cfg))
-        # Sugestão de nome: centroide do grupo vs personagens já conhecidos
-        # (existem quando o anime já foi analisado antes). 0.75 é conservador
-        # — melhor campo vazio que sugestão errada pré-preenchida.
-        _SUGGEST_MIN = 0.75
+
+        def _ranking(centroide: np.ndarray) -> list[tuple[float, str]]:
+            # Um nome pode ter mais de um centroide (banco + provisório): vale
+            # o melhor de cada, senão o 2º colocado seria o próprio 1º.
+            melhor: dict[str, float] = {}
+            for kname, kcent in known_centroids:
+                s = float(centroide @ kcent)
+                if s > melhor.get(kname, -1.0):
+                    melhor[kname] = s
+            return sorted(((s, n) for n, s in melhor.items()), reverse=True)
+
+        # Quem já foi batizado em outro episódio é reconhecido aqui, e os
+        # pedaços do mesmo personagem viram um grupo só. Ver
+        # `face_clustering.reconhece` pras faixas e de onde vieram.
+        nomes_auto: list[str] = []
+        for cl in clusters:
+            r = _ranking(cl.centroid) if do_banco else []
+            nome = reconhece(r)
+            nomes_auto.append(nome if nome in do_banco else "")
+        clusters, nomes_auto = juntar_por_nome(clusters, observations, nomes_auto)
+
+        # Dica "parece X" pros que NÃO foram reconhecidos: aparece como botão,
+        # mas o campo fica vazio. Era 0,75 e vinha preenchido — o grupo de
+        # pescoço chegava escrito "Maomao" e a pessoa tinha que apagar.
+        _SUGGEST_MIN = 0.90
         groups: list[DiscoveredGroup] = []
-        for key, cl in enumerate(clusters):
+        for key, (cl, nome_auto) in enumerate(zip(clusters, nomes_auto)):
             reps = pick_representatives(cl, observations, k=10)
             positions = sorted({observations[i].shot_pos for i in cl.members})
             conf: dict[int, float] = {}
@@ -1923,13 +1983,25 @@ class Pipeline:
                 p = observations[i].shot_pos
                 s = float(observations[i].embedding @ cl.centroid)
                 conf[p] = max(conf.get(p, 0.0), s)
-            suggested, s_sim = "", 0.0
-            for kname, kcent in known_centroids:
-                s = float(cl.centroid @ kcent)
-                if s > s_sim:
-                    s_sim, suggested = s, kname
-            if s_sim < _SUGGEST_MIN:
+            ranking = _ranking(cl.centroid)
+            if nome_auto:
+                suggested = nome_auto
+                s_sim = next((s for s, n in ranking if n == nome_auto), 0.0)
+            elif ranking and ranking[0][0] >= _SUGGEST_MIN:
+                s_sim, suggested = ranking[0]
+            else:
                 suggested, s_sim = "", 0.0
+            # Fora da lista principal: pouca cena, ou um grupo que é mais
+            # cabelo e nuca do que rosto. Cada recorte passou do piso sozinho,
+            # mas quando a MAIORIA do grupo mal passou (mediana abaixo de
+            # 0,55), o que se juntou ali foi cabelo de costas, mão no cabelo,
+            # chapéu — medido no S01E02. Reconhecido nunca sai da lista.
+            pouco_rosto = (
+                p_obs is not None and float(np.median(p_obs[cl.members])) < 0.55
+            )
+            minor = not nome_auto and (
+                len(positions) < _MIN_CENAS_RELEVANTE or pouco_rosto
+            )
             groups.append(DiscoveredGroup(
                 key=key,
                 n_faces=len(cl.members),
@@ -1942,6 +2014,8 @@ class Pipeline:
                 centroid_bytes=to_bytes(cl.centroid),
                 suggested_name=suggested,
                 suggested_sim=s_sim,
+                known=bool(nome_auto),
+                minor=minor,
             ))
         # Ordem por CENAS, não por rostos.
         #
@@ -1954,11 +2028,13 @@ class Pipeline:
         for novo_key, g in enumerate(groups):
             g.key = novo_key
 
-        relevantes = sum(1 for g in groups if g.n_shots >= _MIN_CENAS_RELEVANTE)
+        reconhecidos = sum(1 for g in groups if g.known)
+        novos = sum(1 for g in groups if not g.known and not g.minor)
         cb("organize", 1.0, f"{len(groups)} personagens descobertos")
-        print(f"[Descoberta] {len(observations)} rostos → {len(groups)} grupos "
-              f"({relevantes} com {_MIN_CENAS_RELEVANTE}+ cenas; "
-              f"cenas: {', '.join(str(g.n_shots) for g in groups[:10])}...)", flush=True)
+        print(f"[Descoberta] {len(observations)} rostos → {len(groups)} grupos: "
+              f"{reconhecidos} reconhecidos, {novos} novos pra batizar, "
+              f"{len(groups) - reconhecidos - novos} figurantes "
+              f"(cenas: {', '.join(str(g.n_shots) for g in groups[:10])}...)", flush=True)
 
         self._report_timings(timer, metadata_dir)
         return DiscoveryResult(
@@ -2230,6 +2306,35 @@ class Pipeline:
             render_mode=cfg.render_export_mode,
         )
         return episode_root, metadata_dir, cut_results
+
+    def _textos_rosto(self, get_engine) -> np.ndarray | None:
+        """As frases de "é rosto / não é rosto" embedadas, com cache em disco.
+
+        Embedar texto exige o CLIP carregado (~5s), e reanálise com cache
+        cheio nem carrega o modelo. As frases não mudam entre episódios, então
+        ficam num .npz ao lado do banco, valendo enquanto modelo e frases forem
+        os mesmos.
+        """
+        cfg = self.cfg
+        frases = list(PROMPTS_ROSTO) + list(PROMPTS_NAO_ROSTO)
+        chave = "|".join([cfg.clip_model, cfg.clip_pretrained, *frases])
+        arq = Path(cfg.cache_path) / "textos_rosto.npz"
+        try:
+            with np.load(arq, allow_pickle=False) as z:
+                if str(z["chave"]) == chave:
+                    return z["embs"]
+        except Exception:
+            pass  # sem cache, ou de outro modelo: calcula
+        try:
+            engine = get_engine()
+            if not hasattr(engine, "embed_texts"):
+                return None
+            embs = engine.embed_texts(frases)
+            np.savez(arq, chave=np.array(chave), embs=embs)
+            return embs
+        except Exception as e:
+            print(f"[Descoberta] Filtro de rosto indisponível: {e}", flush=True)
+            return None
 
     def _lazy_models(self, cb: ProgressCb):
         """(get_engine, get_face_det) com carga adiada: os modelos só sobem

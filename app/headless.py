@@ -1531,8 +1531,6 @@ def _discovery_naming_round(
     de megabytes.
     """
     # 1) Grava os recortes que a tela de batismo vai mostrar.
-    from .pipeline import _MIN_CENAS_RELEVANTE
-
     crops_dir = Path(disc.episode_root) / "metadata" / "discovery"
     crops_dir.mkdir(parents=True, exist_ok=True)
     for old in crops_dir.glob("*.jpg"):
@@ -1552,13 +1550,17 @@ def _discovery_naming_round(
                 "shots": g.n_shots,
                 # Figurante: aparece em menos cenas do que o piso. A tela
                 # esconde estes atrás de um botão em vez de perguntar o nome
-                # de duzentos NPCs de fundo.
-                "minor": g.n_shots < _MIN_CENAS_RELEVANTE,
+                # de duzentos NPCs de fundo. Decidido no pipeline, que também
+                # manda pra cá o grupo que é mais nuca do que rosto.
+                "minor": g.minor,
                 # Índice em ref_crops_jpg == índice nesta lista: é o que o
                 # host devolve em `removed`.
                 "crops": crop_files,
                 "suggestedName": g.suggested_name,
                 "suggestedSim": round(g.suggested_sim, 3),
+                # Batizado em outro episódio: o nome vem preenchido. Sem
+                # isto, `suggestedName` é só a dica "parece X".
+                "known": g.known,
             }
         )
 

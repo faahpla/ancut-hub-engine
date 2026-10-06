@@ -103,6 +103,113 @@ def cluster_faces(
     return clusters
 
 
+#: Frases pro CLIP decidir se um recorte é ROSTO. A pergunta é feita a cada
+#: recorte antes de agrupar ("é mais parecido com qual destas legendas?").
+#:
+#: Existe porque o detector de rosto (e o de cabeça, que entra quando o de
+#: rosto não acha nada) devolve nuca, pescoço, cabelo de costas, lanterna,
+#: enfeite — e cada um virava um grupo pro usuário apagar na tela de batismo.
+#: Medido no Apothecary Diaries S01E02 e S01E05 (2552 recortes): abaixo do
+#: piso sobram ~5% dos recortes, e são quase todos nuca e objeto.
+#:
+#: As frases negativas foram escolhidas olhando o que caía. "close-up of an
+#: anime character's mouth" derrubava personagem GRITANDO no escuro (o Lihaku
+#: ia a 0,04); "lips and chin with no eyes visible" pega o recorte de pescoço
+#: e boca sem levar o grito junto.
+PROMPTS_ROSTO = (
+    "an anime character's face",
+    "a portrait of an anime character's face",
+    "an anime character's face in profile",
+    "an anime character with eyes closed",
+)
+PROMPTS_NAO_ROSTO = (
+    "the back of an anime character's head",
+    "anime hair seen from behind",
+    "a close-up of lips and chin with no eyes visible",
+    "a close-up of a neck and collarbone",
+    "an anime character's ear",
+    "a dark silhouette",
+    "an object",
+    "a blurry background",
+)
+#: Abaixo disto o recorte não entra no agrupamento.
+PISO_ROSTO = 0.2
+
+
+def probabilidade_de_rosto(embs: np.ndarray, textos: np.ndarray) -> np.ndarray:
+    """Chance de cada recorte ser um rosto, de 0 a 1.
+
+    `textos` são as frases embedadas, positivas primeiro (na ordem de
+    PROMPTS_ROSTO + PROMPTS_NAO_ROSTO). A conta é a do CLIP zero-shot:
+    softmax sobre as legendas com a temperatura de treino (100), e a chance de
+    "rosto" é a soma das positivas.
+    """
+    if embs.size == 0:
+        return np.zeros(0, dtype=np.float32)
+    logits = 100.0 * embs.astype(np.float32) @ textos.T
+    logits -= logits.max(axis=1, keepdims=True)
+    p = np.exp(logits)
+    p /= p.sum(axis=1, keepdims=True)
+    return p[:, : len(PROMPTS_ROSTO)].sum(axis=1)
+
+
+def reconhece(sims: list[tuple[float, str]]) -> str:
+    """O nome, se o grupo é COM CERTEZA alguém já batizado; senão vazio.
+
+    `sims` é a similaridade do centroide do grupo contra cada personagem já
+    conhecido, da maior pra menor. Duas faixas, medidas cruzando episódios
+    (grupos do S01E02 contra os personagens batizados no S01E05):
+
+    - 0,955 com 0,02 de folga pro segundo: os personagens certos ficaram de
+      0,955 a 0,997. O grupo misturado (várias damas da corte) bateu 0,950
+      contra 0,949 — a folga é o que o separa.
+    - 0,94 com 0,04 de folga: a Maomao de olhos fechados, a chibi, de perfil
+      — mesmo personagem, centroide mais longe, mas sem ninguém disputando.
+
+    Abaixo disso o nome NÃO vem preenchido: o CLIP põe personagens diferentes
+    do mesmo anime a 0,93 um do outro, e nome errado pré-preenchido é pior
+    que campo vazio — a pessoa confia e salva.
+    """
+    if not sims:
+        return ""
+    s1, nome = sims[0]
+    s2 = sims[1][0] if len(sims) > 1 else 0.0
+    if (s1 >= 0.955 and s1 - s2 >= 0.02) or (s1 >= 0.94 and s1 - s2 >= 0.04):
+        return nome
+    return ""
+
+
+def juntar_por_nome(
+    clusters: list[FaceCluster],
+    observations: list[FaceObservation],
+    nomes: list[str],
+) -> tuple[list[FaceCluster], list[str]]:
+    """Funde os grupos reconhecidos como o mesmo personagem.
+
+    O agrupamento parte o mesmo personagem em vários (de frente, de perfil,
+    chorando, chibi) — no S01E05 a Maomao veio em SETE grupos. Quando o nome
+    já é conhecido, perguntar sete vezes é trabalho jogado fora. Grupo sem
+    nome fica como está.
+    """
+    por_nome: dict[str, list[int]] = {}
+    saida_c: list[FaceCluster] = []
+    saida_n: list[str] = []
+    for cl, nome in zip(clusters, nomes):
+        if not nome:
+            saida_c.append(cl)
+            saida_n.append("")
+            continue
+        por_nome.setdefault(nome, []).extend(cl.members)
+    embs = None
+    for nome, membros in por_nome.items():
+        if embs is None:
+            embs = np.stack([o.embedding for o in observations]).astype(np.float32)
+        m = sorted(membros)
+        saida_c.append(FaceCluster(members=m, centroid=_renormalize(embs[m].mean(axis=0))))
+        saida_n.append(nome)
+    return saida_c, saida_n
+
+
 def pick_representatives(
     cluster: FaceCluster,
     observations: list[FaceObservation],

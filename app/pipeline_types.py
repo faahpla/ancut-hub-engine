@@ -41,6 +41,13 @@ class DiscoveredGroup:
     # centroide do grupo contra os personagens do banco ("parece a Eris").
     suggested_name: str = ""
     suggested_sim: float = 0.0
+    # O nome não é palpite: o grupo bateu com folga num personagem batizado
+    # em outro episódio (`face_clustering.reconhece`). A tela já traz o nome
+    # preenchido e põe o grupo na seção "reconhecidos".
+    known: bool = False
+    # Fica atrás do botão de figurantes na tela: poucas cenas, ou um grupo
+    # que é mais nuca e cabelo do que rosto. Decidido no pipeline.
+    minor: bool = False
 
 
 @dataclass
