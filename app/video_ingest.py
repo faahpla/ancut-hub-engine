@@ -174,8 +174,17 @@ _KIND_PATTERNS = [
     (re.compile(r"\bNC(?:OP|_?OPENING)\s*_?(\d+)?\b", re.I), "OP"),
     (re.compile(r"\bNC(?:ED|_?ENDING)\s*_?(\d+)?\b", re.I), "ED"),
     (re.compile(r"\bOP(?:ENING)?\s*_?(\d+)\b", re.I), "OP"),
-    (re.compile(r"\bED|ENDING\s*_?(\d+)\b", re.I), "ED"),
+    # O agrupamento em volta de ED|ENDING é o que importa aqui. Sem ele o `|`
+    # partia a regra em duas, e o `\bED` sozinho, sem número, casava o começo
+    # de qualquer palavra: "Cyberpunk EDgerunners S01E02" virava encerramento
+    # 1, e a fila mandava os dez episódios pro mesmo lugar.
+    (re.compile(r"\b(?:ED|ENDING)\s*_?(\d+)\b", re.I), "ED"),
 ]
+
+#: Onde a marca de abertura/encerramento começa no nome já limpo — daí pra
+#: frente não é mais o nome do anime. Fechada com `\b` dos dois lados: sem o
+#: do fim, "EDgerunners" e "OPus" seriam cortados.
+_KIND_MARK = re.compile(r"\b(?:NC ?)?(?:OPENING|ENDING|OP|ED)(?:\s*\d+)?\b", re.I)
 
 
 #: Ano entre parênteses/colchetes ou solto — "Filme (2019)", "Filme.2019.1080p".
@@ -257,6 +266,13 @@ def parse_filename(video_path: str | Path) -> EpisodeInfo:
         # padrões de episódio acima já o leram como episódio 1. Aqui ele volta
         # pro lugar certo; sem número no nome, assume a primeira.
         episode = kind_num if kind_num is not None else 1
+        # E a marca sai do NOME. "Black Clover - OP Opening 2 v1 PAiNT it
+        # BLACK" chegava inteiro como nome do anime, então cada abertura
+        # virava um anime próprio, numa pasta própria — foi o que o Ajk viu
+        # com as aberturas do Black Clover. O nome é o que vem ANTES da marca.
+        corte = _KIND_MARK.search(name)
+        if corte and name[: corte.start()].strip(" -_."):
+            name = name[: corte.start()].strip(" -_.")
 
     # FILME: sem marca de temporada/episódio e com ano no nome.
     #
