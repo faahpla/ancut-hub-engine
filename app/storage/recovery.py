@@ -174,8 +174,11 @@ def restore(root: Path | str, db: Database) -> RestoreResult:
     elenco = _known_characters(root)
 
     anime_id = db.upsert_anime(anilist_id=None, title=anime_title)
+    # `root`: se a pasta já tem linha no banco (de outro título), é ELA que
+    # volta — sem isto restaurar podia criar uma segunda linha pro mesmo
+    # episódio, o mesmo erro da duplicata da 1.27.
     episode_id = db.upsert_episode(
-        anime_id, season, episode, _bounds_source(root) or "", kind
+        anime_id, season, episode, _bounds_source(root) or "", kind, root=str(root)
     )
     db.set_episode_root(episode_id, str(root))
     # Reconstruir é substituir: se sobrou meia entrada de uma tentativa

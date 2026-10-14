@@ -965,10 +965,16 @@ def _explorer_apply(episode_id: int, character_ids: list[int]) -> None:
     _emit({"type": "explorer-applied", **aplicar(db, episode_id, mudancas, character_ids)})
 
 
-def _orphans() -> None:
-    """Pastas de episódio na saída que o histórico não conhece."""
+def _orphans(extras: list[str] | None = None) -> None:
+    """Pastas de episódio que o histórico não conhece.
+
+    Procura em todo lugar onde a biblioteca mora, não só na pasta de saída:
+    quem move o acervo pra outra pasta (o Ajk) tinha os episódios novos lá e
+    a varredura nunca olhava. Ver `reencontrar.raizes_da_biblioteca`.
+    """
     from .config import Config
     from .storage.db import Database
+    from .storage.reencontrar import raizes_da_biblioteca
     from .storage.recovery import scan
 
     cfg = Config.load()
@@ -977,8 +983,24 @@ def _orphans() -> None:
         _backfill_episode_roots(db, cfg.output_path)
     except Exception:
         pass  # o backfill é oportunista; a varredura vale de qualquer jeito
-    achadas = scan(cfg.output_path, db)
+    vistas: dict[str, Any] = {}
+    for raiz in raizes_da_biblioteca(db, cfg.output_path, [Path(e) for e in extras or []]):
+        for o in scan(raiz, db):
+            vistas.setdefault(str(o.root).lower(), o)
+    achadas = sorted(vistas.values(), key=lambda o: (o.anime.lower(), o.season, o.episode))
     _emit({"type": "orphans", "episodes": [o.payload() for o in achadas]})
+
+
+def _relink(extras: list[str]) -> None:
+    """Religa os episódios cuja pasta mudou de lugar. Ver `reencontrar.py`."""
+    from .config import Config
+    from .storage.db import Database
+    from .storage.reencontrar import religar
+
+    cfg = Config.load()
+    db = Database(cfg.cache_path / "index.db")
+    r = religar(db, cfg.output_path, [Path(e) for e in extras])
+    _emit({"type": "relink", **r.payload()})
 
 
 def _restore(root: str) -> None:
@@ -1664,7 +1686,11 @@ def main(argv: list[str] | None = None) -> int:
             _explorer_apply(int(args[1]), [int(a) for a in args[2:]])
             return 0
         if mode == "orphans":
-            _orphans()
+            _orphans(args[1:])
+            return 0
+        if mode == "relink":
+            # relink [pasta ...] — pastas extras onde procurar
+            _relink(args[1:])
             return 0
         if mode == "restore":
             _restore(args[1])
