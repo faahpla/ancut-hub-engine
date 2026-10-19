@@ -167,6 +167,12 @@ class AniListClient:
                 node = e["node"]
                 name = node["name"].get("full") or node["name"].get("native") or f"Character {node['id']}"
                 img = (node.get("image") or {}).get("large") or (node.get("image") or {}).get("medium")
+                # Personagem sem foto na AniList vem com a imagem padrão
+                # ("NO IMAGE", .../character/large/default.jpg). Baixada, ela
+                # virava REFERÊNCIA — e todo figurante sem foto ficava com o
+                # mesmo rosto cinza, igual entre si.
+                if img and "/default." in img:
+                    img = None
                 chars.append(
                     AniListCharacter(id=node["id"], name=name, role=e.get("role") or "SUPPORTING", image=img)
                 )

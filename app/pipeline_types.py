@@ -48,6 +48,9 @@ class DiscoveredGroup:
     # Fica atrás do botão de figurantes na tela: poucas cenas, ou um grupo
     # que é mais nuca e cabelo do que rosto. Decidido no pipeline.
     minor: bool = False
+    # Até 3 palpites (nome, semelhança), do mais parecido pro menos. A tela
+    # mostra cada um com a foto do personagem: um clique preenche o nome.
+    candidates: list[tuple[str, float]] = field(default_factory=list)
 
 
 @dataclass
@@ -82,6 +85,9 @@ class DiscoveryResult:
     # Elenco oficial (nomes das bases online) — vira dropdown na tela de
     # batismo, pro usuário escolher em vez de digitar.
     roster: list[str] = field(default_factory=list)
+    # Primeira imagem do catálogo de cada nome do elenco, pra baixar a foto
+    # de quem ainda não tem nenhuma (ver references/elenco_com_foto.py).
+    roster_urls: dict[str, str] = field(default_factory=dict)
 
 
 class InsufficientRefsError(RuntimeError):

@@ -12,7 +12,7 @@ from scenedetect import AdaptiveDetector, SceneManager, open_video
 #: é por episódio e sobrevive à reanálise: sem trocar a identidade, episódio
 #: já analisado reusaria os cortes velhos, e a melhora não apareceria
 #: justamente pra quem já tem acervo.
-DETECTOR_ID = "adaptive/ratio=2.0/floor=15.0/curta-cola"
+DETECTOR_ID = "adaptive/ratio=2.0/floor=15.0/curta-cola/refino-aniflow-1"
 
 
 @dataclass
@@ -66,11 +66,16 @@ def detect_shots(
     ganha só 5% de cenas e o dobro de fragmentos curtos. Vale medir de novo
     num episódio de ação antes de descer mais.
     """
+    from .corte_refino import Sinais, refinar
+
     video = open_video(str(video_path))
     sm = SceneManager()
     sm.add_detector(
         AdaptiveDetector(adaptive_threshold=adaptive_ratio, min_content_val=min_content_val)
     )
+    # Anota a luz de cada quadro na MESMA leitura, pro refino lá embaixo.
+    sinais = Sinais()
+    sm.add_detector(sinais)
     # detect_scenes blocks for the whole episode (minutes). The per-cut
     # callback (fires every few seconds of video) feeds real progress to the
     # UI — and gives the cancel button a place to land mid-detection.
@@ -87,6 +92,19 @@ def detect_shots(
     sm.detect_scenes(video, show_progress=False, callback=callback)
     scenes = sm.get_scene_list()
 
+    # Refino do aniFlow (ver corte_refino.py): tira o corte falso de flash e
+    # de movimento dentro do plano, e põe o de dissolve. Trabalha em números
+    # de quadro; as bordas voltam pra segundos aqui.
+    fps = float(video.frame_rate) or 24.0
+    if scenes:
+        fim_video = scenes[-1][1].get_seconds()
+        cortes = [s.get_frames() for s, _ in scenes[1:]]
+        refinados = refinar(cortes, sinais, fps)
+        bordas = [scenes[0][0].get_seconds()] + [q / fps for q in refinados] + [fim_video]
+        intervalos = [(a, b) for a, b in zip(bordas, bordas[1:]) if b > a]
+    else:
+        intervalos = []
+
     # Cena curta demais COLA na anterior, não some.
     #
     # Antes era `continue`: o trecho saía da lista e nenhum clipe cobria
@@ -96,9 +114,7 @@ def detect_shots(
     # aí o buraco deixa de ser detalhe. Colando, ficar mais sensível não custa
     # mais material nenhum.
     shots: list[ShotBounds] = []
-    for s, e in scenes:
-        start = s.get_seconds()
-        end = e.get_seconds()
+    for start, end in intervalos:
         if end - start < min_seconds and shots:
             shots[-1].end = end
             continue

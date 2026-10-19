@@ -1583,8 +1583,35 @@ def _discovery_naming_round(
                 # Batizado em outro episódio: o nome vem preenchido. Sem
                 # isto, `suggestedName` é só a dica "parece X".
                 "known": g.known,
+                # Até 3 palpites; a foto de cada um vem em `cast`.
+                "candidates": [{"name": n, "sim": s} for n, s in g.candidates],
             }
         )
+
+    # O elenco com uma foto por personagem: a tela mostra os palpites com
+    # rosto e abre a galeria do elenco no campo de nome. Falhar aqui não pode
+    # travar o batismo — sem foto, a tela volta a ser só nomes.
+    cast: list[dict] = []
+    try:
+        from .config import Config
+        from .references.elenco_com_foto import preparar_elenco
+        from .references.reference_store import ReferenceStore
+
+        nomes = list(disc.roster)
+        for g in disc.groups:
+            for n, _ in g.candidates:
+                if n not in nomes:
+                    nomes.append(n)
+        cast = preparar_elenco(
+            ReferenceStore(Config.load().cache_path),
+            disc.cache_id,
+            nomes,
+            dict(getattr(disc, "roster_urls", {}) or {}),
+            crops_dir / "elenco",
+            Path(disc.episode_root),
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"[Descoberta] Fotos do elenco indisponíveis: {e}", file=sys.stderr, flush=True)
 
     _emit(
         {
@@ -1596,6 +1623,7 @@ def _discovery_naming_round(
             "totalFaces": disc.total_faces,
             "online": disc.online,
             "roster": list(disc.roster),
+            "cast": cast,
             "groups": groups_payload,
         }
     )

@@ -130,6 +130,22 @@ def _cache_id_for(bundle) -> str:
 _MIN_CENAS_RELEVANTE = 3
 
 
+def _elenco_completo(oficial: list[str], do_banco: list[str]) -> list[str]:
+    """Elenco oficial + quem já foi batizado aqui e não está nele.
+
+    O batismo aceita qualquer nome, e o que a pessoa digitou ("Shin", um
+    figurante recorrente) não existe na AniList. Sem juntar, ele sumia da
+    lista de escolha no episódio seguinte.
+    """
+    vistos = {n.lower() for n in oficial}
+    extra = []
+    for n in do_banco:
+        if n and n.lower() not in vistos:
+            vistos.add(n.lower())
+            extra.append(n)
+    return list(oficial) + sorted(extra, key=str.lower)
+
+
 def _corte_agrupamento(cfg) -> float:
     """O corte de similaridade que junta dois rostos no mesmo grupo.
 
@@ -1991,6 +2007,9 @@ class Pipeline:
                 s_sim, suggested = ranking[0]
             else:
                 suggested, s_sim = "", 0.0
+            # Até 3 palpites com foto na tela. 0,85 de piso: abaixo disso o
+            # CLIP já põe meio elenco empatado e o palpite vira ruído.
+            candidatos = [(n, round(s, 3)) for s, n in ranking[:3] if s >= 0.85]
             # Fora da lista principal: pouca cena, ou um grupo que é mais
             # cabelo e nuca do que rosto. Cada recorte passou do piso sozinho,
             # mas quando a MAIORIA do grupo mal passou (mediana abaixo de
@@ -1999,8 +2018,15 @@ class Pipeline:
             pouco_rosto = (
                 p_obs is not None and float(np.median(p_obs[cl.members])) < 0.55
             )
+            # E, em anime que já tem gente batizada: grupo que não lembra
+            # NINGUÉM conhecido e aparece em menos de 5 cenas. Quem importa
+            # costuma já ter nome, ou voltar várias vezes no episódio; o que
+            # sobra assim é o figurante que o FAAH cansou de pular.
+            desconhecido_raro = (
+                bool(do_banco) and not candidatos and len(positions) < 5
+            )
             minor = not nome_auto and (
-                len(positions) < _MIN_CENAS_RELEVANTE or pouco_rosto
+                len(positions) < _MIN_CENAS_RELEVANTE or pouco_rosto or desconhecido_raro
             )
             groups.append(DiscoveredGroup(
                 key=key,
@@ -2016,6 +2042,7 @@ class Pipeline:
                 suggested_sim=s_sim,
                 known=bool(nome_auto),
                 minor=minor,
+                candidates=candidatos,
             ))
         # Ordem por CENAS, não por rostos.
         #
@@ -2049,9 +2076,13 @@ class Pipeline:
             groups=groups,
             total_faces=len(observations),
             online=online_bundle is not None,
-            roster=(
-                [ch.name for ch in online_bundle.characters]
-                if online_bundle is not None else roster_local
+            roster=_elenco_completo(
+                [ch.name for ch in online_bundle.characters] if online_bundle is not None else [],
+                [n for n, _ in known_centroids] + roster_local,
+            ),
+            roster_urls=(
+                {ch.name: ch.image_urls[0] for ch in online_bundle.characters if ch.image_urls}
+                if online_bundle is not None else {}
             ),
         )
 

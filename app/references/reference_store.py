@@ -10,7 +10,7 @@ import httpx
 
 from ..providers.anime_provider import AnimeBundle, CharacterRef
 from .image_downloader import _HEADERS, _name_for, download_to
-from .image_filters import HASH_FILENAME, is_monochrome
+from .image_filters import HASH_FILENAME, PLACEHOLDERS, is_monochrome
 
 
 _SAFE = re.compile(r'[<>:"/\\|?*]')
@@ -120,6 +120,8 @@ class ReferenceStore:
                     p = download_to(url, d, client=client)
                     if p is None:
                         continue
+                    if p.name.lower() in PLACEHOLDERS:
+                        continue  # "NO IMAGE" da AniList (catálogo em cache antigo)
                     downloaded += 1
                     img = cv2.imread(str(p))
                     if img is not None and is_monochrome(img):
@@ -157,4 +159,5 @@ class ReferenceStore:
         d = self.character_dir(cache_id, character_name)
         if not d.exists():
             return []
-        return [p for p in d.iterdir() if p.is_file()]
+        # Sem a imagem "NO IMAGE" da AniList: ela não é rosto de ninguém.
+        return [p for p in d.iterdir() if p.is_file() and p.name.lower() not in PLACEHOLDERS]
