@@ -250,6 +250,10 @@ class Config:
     # complex labs, crowded scenes). Use manual OP/ED time skip in the UI
     # for reliable credit exclusion. Users can still flip this on per run.
     skip_credit_shots: bool = False
+    # Pular os capítulos marcados no arquivo como abertura, encerramento,
+    # recapitulação e prévia (ver capitulos.py). Ligado por padrão: arquivo
+    # sem marcação não muda nada.
+    pular_capitulos: bool = True
     credit_edge_threshold: float = 0.55
     credit_min_keyframes: int = 2
     # ViT-L/14: ~890MB download on first run, much better anime discrimination

@@ -67,7 +67,7 @@ from .providers.anime_provider import (
     local_cache_id,
 )
 from .references.reference_store import ReferenceStore
-from .shot_detection import DETECTOR_ID, ShotBounds, detect_shots
+from .shot_detection import DETECTOR_ID, DETECTORES_ACEITOS, ShotBounds, detect_shots
 from .storage.db import Database
 from .storage.metadata_writer import build_shot_payload, write_characters_json, write_shots_json
 from .storage.anime_folders import AnimeFolderStore
@@ -2261,15 +2261,15 @@ class Pipeline:
         if bounds_cache.exists():
             try:
                 data = json.loads(bounds_cache.read_text(encoding="utf-8"))
-                # `detector` entrou junto com a detecção adaptativa. Cache
-                # gravado antes disso não tem a chave, não bate com o
-                # DETECTOR_ID de hoje, e é recomputado — que é exatamente o
-                # que precisa acontecer: senão a reanálise de um episódio
-                # antigo reusaria os cortes ruins e nada mudaria.
+                # Vale qualquer corte de DETECTORES_ACEITOS (v1, v2, v3 e o
+                # da 1.32): episódio já cortado não é recortado, porque a
+                # curadoria manual guarda o NÚMERO da cena e ele mudaria. Só
+                # cache de antes disso (razão 3,0, ou sem `detector`) é
+                # refeito.
                 if (
                     isinstance(data, dict)
                     and data.get("source") == str(info.source)
-                    and data.get("detector") == DETECTOR_ID
+                    and data.get("detector") in DETECTORES_ACEITOS
                     and abs(float(data.get("min_seconds", -1)) - cfg.min_shot_seconds) < 1e-6
                 ):
                     shots = [
@@ -2297,7 +2297,8 @@ class Pipeline:
                 json.dumps(
                     {
                         "source": str(info.source),
-                        "detector": DETECTOR_ID,
+                        # O que saiu DE VERDADE: o v3 que falha cai pro v2.
+                        "detector": getattr(shots, "detector", DETECTOR_ID),
                         "min_seconds": cfg.min_shot_seconds,
                         "shots": [
                             {"idx": s.idx, "start": s.start, "end": s.end} for s in shots
@@ -2321,6 +2322,32 @@ class Pipeline:
                 f"[CorteCenas] Skip manual: início {info.skip_head_seconds:.0f}s, "
                 f"fim {info.skip_tail_seconds:.0f}s → {before - len(shots)} shots ignorados"
             )
+
+        # Abertura, encerramento, recapitulação e prévia marcados no próprio
+        # arquivo (capítulos do MKV). Filtra DEPOIS do cache de cortes, como o
+        # skip manual: os números das cenas não mudam, só quais são cortadas.
+        # Arquivo que já É uma abertura (kind OP/ED) não pula nada; filme pula
+        # os créditos marcados, se houver.
+        if shots and getattr(cfg, "pular_capitulos", True) and info.kind not in ("OP", "ED"):
+            from .capitulos import fora_dos_trechos, ler_capitulos, trechos_pulados
+
+            trechos = trechos_pulados(ler_capitulos(info.source))
+            if trechos:
+                before = len(shots)
+                shots = [s for s in shots if fora_dos_trechos(s.start, s.end, trechos)]
+                nomes = {"OP": "abertura", "ED": "encerramento", "RECAP": "recapitulação",
+                         "PREVIEW": "prévia"}
+                partes = ", ".join(
+                    f"{nomes.get(t, t)} {int(a // 60):02d}:{int(a % 60):02d}-"
+                    f"{int(b // 60):02d}:{int(b % 60):02d}"
+                    for a, b, t in trechos
+                )
+                print(
+                    f"[CorteCenas] Capitulos do arquivo: {partes} -> "
+                    f"{before - len(shots)} cenas puladas",
+                    flush=True,
+                )
+                cb("detect_shots", 1.0, f"Pulando {partes}")
 
         def cut_cb(done: int, total: int, skipped: int) -> None:
             suffix = f" ({skipped} já em cache)" if skipped else ""

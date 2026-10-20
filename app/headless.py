@@ -324,6 +324,11 @@ def _parse(path: str) -> None:
     from .video_ingest import parse_filename
 
     info = parse_filename(path)
+    # As marcações do próprio arquivo, pra tela mostrar o que vai ser pulado
+    # antes de a pessoa apertar Analisar.
+    from .capitulos import ler_capitulos
+
+    capitulos = [c.payload() for c in ler_capitulos(path)]
     head, tail = 0.0, 0.0
     try:
         store = SkipRangesStore(Config.load().cache_path)
@@ -340,6 +345,7 @@ def _parse(path: str) -> None:
             "kind": info.kind,
             "skipHeadSeconds": head,
             "skipTailSeconds": tail,
+            "chapters": capitulos,
         }
     )
 
@@ -1401,6 +1407,7 @@ def _apply_request_to_config(cfg: Any, req: dict[str, Any]) -> None:
     if "credit" in params:
         cfg.credit_edge_threshold = float(params["credit"])
     cfg.skip_credit_shots = bool(req.get("skipCreditShots", False))
+    cfg.pular_capitulos = bool(req.get("skipChapters", True))
     cfg.use_danbooru = bool(req.get("useDanbooru", False))
     # Tipo de mídia: escolhe o par de modelos que olha o rosto. Valor
     # desconhecido cai em "anime" — o app nasceu assim e é o que não surpreende
