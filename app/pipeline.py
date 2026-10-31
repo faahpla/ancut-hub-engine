@@ -347,6 +347,29 @@ class Pipeline:
         # criadas à mão). Sem isto, as fotos delas ficavam invisíveis — bug
         # real: usuário batizou "Mitsuhime", o MAL chama de "Yukishiro,
         # Mitsuhime", e a análise dizia "sem referências suficientes".
+        # Elencos importados de outro AnCut (pacote de personagens) que batem
+        # com este anime — pelo id, pela franquia ou pelo título-base. As
+        # fotos vão pra pasta de refs DESTA análise e o centroide pro
+        # personagem DESTA linha de anime: daqui pra baixo é o caminho de
+        # sempre. Ver storage/elencos_importados.py.
+        from .storage.elencos_importados import aplicar as aplicar_importados
+
+        _ligados, so_centroide = aplicar_importados(
+            cfg.cache_path, self.db, ref_store, cache_id, anime_id,
+            [bundle.anilist_id, *(bundle.franchise_ids or [])],
+            [bundle.title, bundle.title_english or "", info.anime],
+            {"clip": cfg.clip_model, "pretrained": cfg.clip_pretrained},
+        )
+        if so_centroide:
+            from .naming import find_token_match as _ftm
+            nomes_bundle = [ch.name for ch in bundle.characters]
+            for nm in sorted(so_centroide):
+                if nm not in nomes_bundle and _ftm(nm, nomes_bundle) is None:
+                    bundle.characters.append(
+                        CharacterRef(mal_id=None, anilist_id=None, name=nm,
+                                     role="Main", image_urls=[])
+                    )
+
         extra_locals = self._local_only_characters(ref_store, cache_id, bundle)
         for name in extra_locals:
             bundle.characters.append(
@@ -400,6 +423,19 @@ class Pipeline:
             cb("embed_refs", i / total_chars, f"Embeddando: {ch.name}")
             paths = refs_per_char.get(ch.name, [])
             if len(paths) < cfg.min_references_per_character:
+                # Personagem de um pacote importado que veio SEM foto, mas
+                # com centroide: o centroide é a média dos rostos que outra
+                # pessoa aprovou no batismo — vale mais que 2 fotos da
+                # internet. Entra com ele em vez de ser ignorado.
+                linha = db_chars.get(ch.name)
+                if ch.name in so_centroide and linha and linha.get("embedding"):
+                    entries.append(CharacterEntry(
+                        id=linha["id"], name=ch.name,
+                        centroid=from_bytes(linha["embedding"]),
+                        threshold=cfg.default_threshold, prototypes=None, ref_faces=0,
+                    ))
+                    ref_stats.append((ch.name, 0, 0))
+                    continue
                 ref_stats.append((ch.name, len(paths), 0))
                 skipped_few_refs.append(f"{ch.name}({len(paths)})")
                 continue
@@ -1746,6 +1782,9 @@ class Pipeline:
             # lá em cima, sem ela. Gravar aqui é o que faz a próxima análise
             # deste anime achar a pasta, mesmo que ele digite outro nome.
             pastas.remember(info.anime, pasta_anime, disc_cache_id)
+            self._ligar_importados(disc_cache_id, anime_id,
+                                   [online_bundle.anilist_id, *(online_bundle.franchise_ids or [])],
+                                   [online_bundle.title, online_bundle.title_english or "", info.anime])
             for row in self.db.get_characters_for_anime(anime_id):
                 if row.get("embedding"):
                     known_centroids.append((row["name"], from_bytes(row["embedding"])))
@@ -1774,6 +1813,7 @@ class Pipeline:
                 anilist_id=None, mal_id=None, title=info.anime, title_english=None
             )
             disc_cache_id = local_cache_id(info.anime)
+            self._ligar_importados(disc_cache_id, anime_id, [], [info.anime])
             # Fonte fora do ar não apaga o que já está no disco.
             #
             # Se este anime já foi analisado alguma vez, os personagens dele
@@ -2381,6 +2421,20 @@ class Pipeline:
             render_mode=cfg.render_export_mode,
         )
         return episode_root, metadata_dir, cut_results
+
+    def _ligar_importados(self, cache_id: str, anime_id: int, ids: list, titulos: list[str]) -> None:
+        """Descoberta: liga os elencos importados que batem com este anime
+        (fotos na pasta de refs, centroide no banco) ANTES de ler os
+        centroides conhecidos — aí o importado é reconhecido como quem foi
+        batizado aqui."""
+        from .storage.elencos_importados import aplicar
+
+        try:
+            aplicar(self.cfg.cache_path, self.db, ReferenceStore(self.cfg.cache_path),
+                    cache_id, anime_id, [i for i in ids if i], titulos,
+                    {"clip": self.cfg.clip_model, "pretrained": self.cfg.clip_pretrained})
+        except Exception as e:  # noqa: BLE001 — elenco importado é ajuda, não pode travar
+            print(f"[Elenco] não deu pra ligar o elenco importado: {e}", flush=True)
 
     def _animes_da_franquia(self, anilist_ids: list[int], tirando: int) -> list[int]:
         """As linhas de anime do banco que são temporadas desta franquia."""

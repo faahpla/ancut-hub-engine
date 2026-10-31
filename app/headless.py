@@ -997,7 +997,7 @@ def _orphans(extras: list[str] | None = None) -> None:
     _emit({"type": "orphans", "episodes": [o.payload() for o in achadas]})
 
 
-def _cast_export(destino: str, episode_ids: list[int]) -> None:
+def _cast_export(destino: str, episode_ids: list[int], nome_pasta: str = "") -> None:
     """Pacote de personagens dos animes destes episódios. Ver elenco_pacote.py."""
     from .config import Config
     from .storage.db import Database
@@ -1006,20 +1006,26 @@ def _cast_export(destino: str, episode_ids: list[int]) -> None:
     cfg = Config.load()
     db = Database(cfg.cache_path / "index.db")
     r = exportar(db, cfg.cache_path, episode_ids, Path(destino),
-                 {"clip": cfg.clip_model, "pretrained": cfg.clip_pretrained})
+                 {"clip": cfg.clip_model, "pretrained": cfg.clip_pretrained}, nome_pasta)
     _emit({"type": "cast-export", "file": destino, **r.payload()})
 
 
-def _cast_import(pacote: str) -> None:
-    """Ensina a este AnCut os personagens de um pacote exportado por outro."""
+def _cast_inspect(pacote: str) -> None:
+    """O que um pacote traz — a tela pergunta a qual anime ligar antes."""
+    from .storage.elenco_pacote import inspecionar
+
+    _emit({"type": "cast-inspect", **inspecionar(Path(pacote))})
+
+
+def _cast_import(pacote: str, titulo: str = "") -> None:
+    """Guarda um pacote de personagens como elenco importado (não mexe no
+    banco: a análise liga na hora, pelo id ou pelo título-base)."""
     from .config import Config
-    from .storage.db import Database
     from .storage.elenco_pacote import importar
 
     cfg = Config.load()
-    db = Database(cfg.cache_path / "index.db")
-    r = importar(db, cfg.cache_path, Path(pacote),
-                 {"clip": cfg.clip_model, "pretrained": cfg.clip_pretrained})
+    r = importar(cfg.cache_path, Path(pacote),
+                 {"clip": cfg.clip_model, "pretrained": cfg.clip_pretrained}, titulo)
     _emit({"type": "cast-import", **r.payload()})
 
 
@@ -1750,11 +1756,16 @@ def main(argv: list[str] | None = None) -> int:
             _orphans(args[1:])
             return 0
         if mode == "cast-export":
-            # cast-export <arquivo.zip> <id,id,...>
-            _cast_export(args[1], [int(x) for x in args[2].split(",") if x.strip()])
+            # cast-export <arquivo.zip> <id,id,...> [nome da pasta do anime]
+            _cast_export(args[1], [int(x) for x in args[2].split(",") if x.strip()],
+                         args[3] if len(args) > 3 else "")
+            return 0
+        if mode == "cast-inspect":
+            _cast_inspect(args[1])
             return 0
         if mode == "cast-import":
-            _cast_import(args[1])
+            # cast-import <arquivo.zip> [título a que ligar]
+            _cast_import(args[1], args[2] if len(args) > 2 else "")
             return 0
         if mode == "relink":
             # relink [pasta ...] — pastas extras onde procurar
