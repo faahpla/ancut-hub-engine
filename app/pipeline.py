@@ -1749,6 +1749,23 @@ class Pipeline:
             for row in self.db.get_characters_for_anime(anime_id):
                 if row.get("embedding"):
                     known_centroids.append((row["name"], from_bytes(row["embedding"])))
+            # Ninguém batizado NESTA temporada: vale quem foi batizado em
+            # outra da mesma franquia. Os personagens são por temporada no
+            # banco, e sem isto a 4ª temporada do Slime começava do zero com
+            # a 3ª toda batizada ao lado — e um pacote de personagens
+            # importado (storage/elenco_pacote.py) só servia se o arquivo
+            # caísse exatamente na temporada exportada.
+            if not known_centroids and online_bundle.franchise_ids:
+                vistos: set[str] = set()
+                for irmao in self._animes_da_franquia(online_bundle.franchise_ids, anime_id):
+                    for row in self.db.get_characters_for_anime(irmao):
+                        nome_ = (row.get("name") or "").strip()
+                        if row.get("embedding") and nome_ and nome_.lower() not in vistos:
+                            vistos.add(nome_.lower())
+                            known_centroids.append((nome_, from_bytes(row["embedding"])))
+                if known_centroids:
+                    print(f"[Descoberta] {len(known_centroids)} personagens de outras "
+                          "temporadas da franquia.", flush=True)
             cb("fetch_characters", 1.0,
                f"{anime_title} — descoberta reforçando o banco existente")
         else:
@@ -2364,6 +2381,20 @@ class Pipeline:
             render_mode=cfg.render_export_mode,
         )
         return episode_root, metadata_dir, cut_results
+
+    def _animes_da_franquia(self, anilist_ids: list[int], tirando: int) -> list[int]:
+        """As linhas de anime do banco que são temporadas desta franquia."""
+        ids = [int(i) for i in anilist_ids or [] if i]
+        if not ids:
+            return []
+        marcas = ",".join("?" * len(ids))
+        with self.db.connect() as c:
+            return [
+                int(r["id"]) for r in c.execute(
+                    f"SELECT id FROM anime WHERE anilist_id IN ({marcas}) AND id != ?",
+                    (*ids, tirando),
+                )
+            ]
 
     def _textos_rosto(self, get_engine) -> np.ndarray | None:
         """As frases de "é rosto / não é rosto" embedadas, com cache em disco.

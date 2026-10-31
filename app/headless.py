@@ -997,6 +997,32 @@ def _orphans(extras: list[str] | None = None) -> None:
     _emit({"type": "orphans", "episodes": [o.payload() for o in achadas]})
 
 
+def _cast_export(destino: str, episode_ids: list[int]) -> None:
+    """Pacote de personagens dos animes destes episódios. Ver elenco_pacote.py."""
+    from .config import Config
+    from .storage.db import Database
+    from .storage.elenco_pacote import exportar
+
+    cfg = Config.load()
+    db = Database(cfg.cache_path / "index.db")
+    r = exportar(db, cfg.cache_path, episode_ids, Path(destino),
+                 {"clip": cfg.clip_model, "pretrained": cfg.clip_pretrained})
+    _emit({"type": "cast-export", "file": destino, **r.payload()})
+
+
+def _cast_import(pacote: str) -> None:
+    """Ensina a este AnCut os personagens de um pacote exportado por outro."""
+    from .config import Config
+    from .storage.db import Database
+    from .storage.elenco_pacote import importar
+
+    cfg = Config.load()
+    db = Database(cfg.cache_path / "index.db")
+    r = importar(db, cfg.cache_path, Path(pacote),
+                 {"clip": cfg.clip_model, "pretrained": cfg.clip_pretrained})
+    _emit({"type": "cast-import", **r.payload()})
+
+
 def _relink(extras: list[str]) -> None:
     """Religa os episódios cuja pasta mudou de lugar. Ver `reencontrar.py`."""
     from .config import Config
@@ -1722,6 +1748,13 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if mode == "orphans":
             _orphans(args[1:])
+            return 0
+        if mode == "cast-export":
+            # cast-export <arquivo.zip> <id,id,...>
+            _cast_export(args[1], [int(x) for x in args[2].split(",") if x.strip()])
+            return 0
+        if mode == "cast-import":
+            _cast_import(args[1])
             return 0
         if mode == "relink":
             # relink [pasta ...] — pastas extras onde procurar
