@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable
@@ -10,8 +11,9 @@ from ..pipeline_types import AnimeNotFoundError
 from ..storage.anime_folders import resolver_franquia
 from .anilist import AniListAnime, AniListClient, AniListRelation
 from .danbooru import DanbooruClient, character_tag_candidates
-from .jikan import JikanClient
+from .jikan import JikanAnime
 from .kitsu import KitsuClient
+from .mal_direto import ElencoDoMal, MalDireto
 
 _ROLE_WEIGHT = {"Main": 0, "MAIN": 0, "Supporting": 1, "SUPPORTING": 1, "Background": 2, "BACKGROUND": 2}
 
@@ -95,6 +97,16 @@ class AnimeBundle:
     missing_gallery: list[int] | None = None
     #: Quando foi montado (ISO). Serve pra saber a idade de um banco parcial.
     fetched_at: str | None = None
+    #: O retrato da AniList já foi procurado no elenco INTEIRO da franquia.
+    #: Banco de antes (só o elenco da raiz) completa uma vez ao abrir.
+    retratos_anilist: bool = False
+    #: A galeria do MAL já foi pedida pro elenco inteiro. Banco de antes (só
+    #: os 18 principais) completa uma vez ao abrir.
+    galerias_de_todos: bool = False
+
+
+#: A espera no "Too Many Requests" da AniList (o limite dela é por minuto).
+ESPERA_DO_LIMITE_S = 30.0
 
 
 def _mais_velho_que(quando_iso: str | None, horas: float) -> bool:
@@ -142,7 +154,12 @@ class AnimeProvider:
         self.cache_root = Path(cache_root) / "anime_db"
         self.cache_root.mkdir(parents=True, exist_ok=True)
         self.anilist = AniListClient()
-        self.jikan = JikanClient()
+        # O elenco e as galerias do MAL só pelo site (mal_direto.py, do
+        # Dangai), com cache em anime_db/_mal_direto. O Jikan saiu: o
+        # api.jikan.moe parou de abrir (out/2026, rede do Levi; aqui ele
+        # vivia em 504), e sem ele o AnCut ficava sem galeria nenhuma e a
+        # análise parava em "sem referências".
+        self.mal_site = ElencoDoMal(MalDireto(self.cache_root / "_mal_direto"))
         self.kitsu = KitsuClient()
         self.danbooru = DanbooruClient()
         # Problemas de fonte na ÚLTIMA resolve() (ex.: MyAnimeList fora do
@@ -152,7 +169,7 @@ class AnimeProvider:
 
     def close(self) -> None:
         self.anilist.close()
-        self.jikan.close()
+        self.mal_site.close()
         self.kitsu.close()
         self.danbooru.close()
 
@@ -231,6 +248,8 @@ class AnimeProvider:
                 partial=bool(data.get("partial", False)),
                 missing_gallery=data.get("missing_gallery") or [],
                 fetched_at=data.get("fetched_at"),
+                retratos_anilist=bool(data.get("retratos_anilist", False)),
+                galerias_de_todos=bool(data.get("galerias_de_todos", False)),
             )
         except Exception:
             return None
@@ -255,6 +274,8 @@ class AnimeProvider:
             "partial": bundle.partial,
             "missing_gallery": bundle.missing_gallery or [],
             "fetched_at": bundle.fetched_at or _agora(),
+            "retratos_anilist": bundle.retratos_anilist,
+            "galerias_de_todos": bundle.galerias_de_todos,
             "characters": [asdict(c) for c in bundle.characters],
         }
         p.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -326,6 +347,8 @@ class AnimeProvider:
         por 3 personagens, não pelos 80. Se o MyAnimeList continuar fora, o
         disjuntor corta na quinta falha e a rodada custa segundos.
         """
+        bundle = self._completar_retratos_anilist(cache_id, bundle, status)
+        bundle = self._completar_galerias_de_todos(cache_id, bundle, status)
         faltando = list(bundle.missing_gallery or [])
         if not faltando:
             return bundle
@@ -349,9 +372,9 @@ class AnimeProvider:
             ch = por_mal.get(mal_id)
             if ch is None:
                 continue  # sumiu do elenco: não é mais dívida
-            antes = self.jikan.failures
-            pics = self.jikan.character_pictures(mal_id)
-            if self.jikan.failures > antes:
+            antes = self.mal_site.failures
+            pics = self.mal_site.character_pictures(mal_id)
+            if self.mal_site.failures > antes:
                 ainda_faltam.append(mal_id)
                 continue
             novas = [u for u in pics if u not in ch.image_urls]
@@ -372,6 +395,149 @@ class AnimeProvider:
             + (f", {len(ainda_faltam)} ainda faltando." if ainda_faltam else ", banco completo.")
         )
         return bundle
+
+    def _elenco_anilist(self, ids: list[int]) -> tuple[list, bool]:
+        """O elenco da AniList de TODA a franquia, sem repetir (do Dangai).
+
+        Antes só o da raiz (o menor id), que no Black Clover é o especial da
+        Jump Festa 2016: 10 personagens. A série de 2017 tem 160, a 2ª
+        temporada 35, o filme 43. Cada um até o fim (16 páginas = 400).
+
+        São uns 13 pedidos seguidos: no "Too Many Requests" (429) espera e
+        tenta o mesmo anime mais uma vez. Devolve (elenco, completo):
+        `completo` falso = algum anime ficou de fora.
+        """
+        vistos: set[int] = set()
+        elenco: list = []
+        completo = True
+        for i in ids:
+            if not i:
+                continue
+            achados: list = []
+            for tentativa in range(2):
+                try:
+                    achados = self.anilist.get_characters(i, max_pages=16)
+                    break
+                except RuntimeError as e:
+                    if "429" in str(e) and tentativa == 0:
+                        time.sleep(ESPERA_DO_LIMITE_S)
+                        continue
+                    completo = False
+                    break
+                except Exception:
+                    completo = False
+                    break
+            for ac in achados:
+                if ac.id not in vistos:
+                    vistos.add(ac.id)
+                    elenco.append(ac)
+        return elenco, completo
+
+    def _completar_retratos_anilist(
+        self,
+        cache_id: str,
+        bundle: AnimeBundle,
+        status: Callable[[str], None],
+    ) -> AnimeBundle:
+        """O retrato da AniList em quem ainda não tem, uma vez (do Dangai).
+
+        O banco montado antes só olhava o elenco da RAIZ da franquia (ver
+        `_elenco_anilist`). Só ACRESCENTA a URL no fim; a galeria e os outros
+        retratos ficam como estão. AniList fora do ar: tenta de novo na
+        próxima análise. No Black Clover do Levi, personagens com 1 foto só
+        caíram de 71 pra 13.
+        """
+        if bundle.retratos_anilist:
+            return bundle
+        ids = list(bundle.franchise_ids or []) or [
+            i for i in (bundle.franchise_root_id, bundle.anilist_id) if i
+        ]
+        if not ids:
+            return bundle
+        al_chars, completo = self._elenco_anilist(ids)
+        if not al_chars:
+            return bundle
+        por_tokens = {_name_tokens(c.name): c for c in bundle.characters}
+        novos = 0
+        for ac in al_chars:
+            ch = por_tokens.get(_name_tokens(ac.name))
+            if (ch is not None and ac.image and ac.image not in ch.image_urls
+                    and "/default." not in ac.image):
+                ch.image_urls.append(ac.image)
+                novos += 1
+        bundle.retratos_anilist = completo
+        if novos or completo:
+            self.save_cache(cache_id, bundle)
+        if novos:
+            status(f"AniList: +1 foto pra {novos} personagens do banco guardado.")
+        return bundle
+
+    def _completar_galerias_de_todos(
+        self,
+        cache_id: str,
+        bundle: AnimeBundle,
+        status: Callable[[str], None],
+    ) -> AnimeBundle:
+        """A galeria do MAL de quem ficou sem, uma vez (do Dangai).
+
+        O banco montado antes só pedia a galeria dos 18 primeiros
+        (gallery_for_top_characters); o resto ficava só com os retratos — que
+        na prática são o retrato do MAL e o mesmo desenho na AniList. Quem já
+        tem 4 fotos ou mais não pede de novo. A galeria entra na FRENTE; quem
+        o site não atendeu vai pro `missing_gallery`, e o
+        `_completar_galerias` tenta de novo depois.
+        """
+        if bundle.galerias_de_todos:
+            return bundle
+        pedir = [c for c in bundle.characters if c.mal_id is not None and len(c.image_urls) < 4]
+        if pedir:
+            status(f"Buscando a galeria do MyAnimeList de mais {len(pedir)} personagens (uma vez)...")
+        faltam = list(bundle.missing_gallery or [])
+        ganharam = 0
+        for ch in pedir:
+            antes = self.mal_site.failures
+            pics = self.mal_site.character_pictures(ch.mal_id)
+            if self.mal_site.failures > antes:
+                if ch.mal_id not in faltam:
+                    faltam.append(ch.mal_id)
+                continue
+            novas = [u for u in pics if u not in ch.image_urls]
+            if novas:
+                ch.image_urls[:0] = novas
+                ganharam += 1
+        bundle.missing_gallery = faltam
+        bundle.partial = bool(faltam)
+        bundle.galerias_de_todos = True
+        self.save_cache(cache_id, bundle)
+        if pedir:
+            status(f"MyAnimeList: galeria nova para {ganharam} personagens.")
+        return bundle
+
+    def _buscar_no_mal(self, termo: str) -> JikanAnime | None:
+        """Reserva da busca quando a AniList não acha: a busca do site do MAL.
+
+        Era o `search_anime` do Jikan. Devolve o primeiro anime de verdade
+        (sem clipe musical, comercial, trailer) no formato que o resto do
+        fluxo já usava. Falha de rede conta em `failures`, que é o que separa
+        "anime não existe" de "fonte fora do ar" na mensagem.
+        """
+        cands = self.mal_site.mal.buscar_anime(termo)
+        if cands is None:
+            self.mal_site.failures += 1
+            return None
+        for c in cands:
+            formato = (getattr(c, "formato", None) or "").lower()
+            if formato in ("music", "cm", "pv"):
+                continue
+            if not getattr(c, "mal_id", None):
+                continue
+            return JikanAnime(
+                mal_id=int(c.mal_id),
+                title=c.titulo or f"MAL {c.mal_id}",
+                title_english=getattr(c, "titulo_ingles", None),
+                cover=getattr(c, "capa", None),
+            )
+        return None
 
     def resolve(
         self,
@@ -441,9 +607,9 @@ class AnimeProvider:
                     "(sem agrupamento de temporadas)..."
                 )
             jikan_hit = None
-            fails_pre_search = self.jikan.failures
+            fails_pre_search = self.mal_site.failures
             for q in queries:
-                jikan_hit = self.jikan.search_anime(q)
+                jikan_hit = self._buscar_no_mal(q)
                 if jikan_hit is not None:
                     used_query = q
                     break
@@ -466,7 +632,7 @@ class AnimeProvider:
                 fora = []
                 if anilist_error is not None:
                     fora.append(str(anilist_error).rstrip("."))
-                if self.jikan.failures > fails_pre_search:
+                if self.mal_site.failures > fails_pre_search:
                     fora.append("MyAnimeList não respondeu (erro de servidor)")
                 fonte_fora = (
                     "\n\n⚠️ Detalhe importante: "
@@ -543,13 +709,13 @@ class AnimeProvider:
 
         status(f"Baixando personagens de {len(franchise_mal_ids)} temporada(s)...")
         self.source_warnings = []
-        fails_start = self.jikan.failures
+        fails_start = self.mal_site.failures
 
         # 2) Collect characters from every season, merge by name.
         merged: dict[str, dict] = {}     # key = lowercase name
         for m_id in franchise_mal_ids:
             try:
-                season_chars = self.jikan.anime_characters(m_id)
+                season_chars = self.mal_site.anime_characters(m_id)
             except Exception:
                 continue
             for jc in season_chars:
@@ -568,7 +734,7 @@ class AnimeProvider:
                     if _ROLE_WEIGHT.get(jc.role, 3) < _ROLE_WEIGHT.get(merged[key]["role"], 3):
                         merged[key]["role"] = jc.role
 
-        cast_fails = self.jikan.failures - fails_start
+        cast_fails = self.mal_site.failures - fails_start
         if cast_fails:
             self.source_warnings.append(
                 f"O MyAnimeList não respondeu em {cast_fails} de "
@@ -583,9 +749,12 @@ class AnimeProvider:
         # MyAnimeList está fora do ar (dias inteiros de 504 em jul/2026) e
         # fonte EXTRA de fotos quando não está.
         al_chars: list = []
+        al_completo = False
         if anilist_id is not None:
             try:
-                al_chars = self.anilist.get_characters(root_id or anilist_id)
+                al_chars, al_completo = self._elenco_anilist(
+                    franchise_anilist_ids or [root_id or anilist_id]
+                )
             except Exception:
                 pass
         if al_chars and merged:
@@ -685,9 +854,9 @@ class AnimeProvider:
             # reserva AniList — sem galeria do MAL pra buscar.)
             jikan_urls: list[str] = []
             if ch["mal_id"] is not None and i <= gallery_limit:
-                antes = self.jikan.failures
-                pics = self.jikan.character_pictures(ch["mal_id"])
-                if self.jikan.failures > antes:
+                antes = self.mal_site.failures
+                pics = self.mal_site.character_pictures(ch["mal_id"])
+                if self.mal_site.failures > antes:
                     # Falhou (não é "esse personagem não tem foto"): anota pra
                     # próxima rodada tentar SÓ estes, em vez de tudo de novo.
                     sem_galeria.append(ch["mal_id"])
@@ -736,7 +905,9 @@ class AnimeProvider:
         # o limite dos principais, comparar com o elenco inteiro nunca
         # dispararia o aviso (metade de 80 nunca é atingida pedindo só 18).
         attempted = min(gallery_limit, len(sorted_chars))
-        pic_fails = self.jikan.failures - fails_start - cast_fails
+        if self.mal_site.pelo_mal:
+            status(f"MyAnimeList: {self.mal_site.pelo_mal} leituras.")
+        pic_fails = self.mal_site.failures - fails_start - cast_fails
         if pic_fails and attempted and pic_fails >= max(1, attempted // 2):
             self.source_warnings.append(
                 f"As galerias de fotos do MyAnimeList falharam em {pic_fails} de "
@@ -751,6 +922,10 @@ class AnimeProvider:
             characters=resolved,
             franchise_ids=franchise_anilist_ids,
             franchise_root_id=root_id,
+            # O elenco inteiro da AniList já foi procurado (2b), e a galeria
+            # pedida pra todo mundo quando o limite cobre o elenco inteiro.
+            retratos_anilist=al_completo,
+            galerias_de_todos=gallery_limit >= len(sorted_chars),
         )
         # Banco montado com a fonte fora do ar é DEGRADADO. Antes ele era
         # simplesmente DESCARTADO, pra não congelar o estrago — mas isso
@@ -759,7 +934,7 @@ class AnimeProvider:
         # ele mais cai. Agora é guardado marcado como parcial, com a lista de
         # quem ficou sem galeria: a próxima rodada reusa o que já tem e tenta
         # SÓ o que falta.
-        bundle.partial = bool(sem_galeria) or self.jikan.failures != fails_start
+        bundle.partial = bool(sem_galeria) or self.mal_site.failures != fails_start
         bundle.missing_gallery = sem_galeria
         bundle.fetched_at = _agora()
         self.save_cache(cache_id, bundle)

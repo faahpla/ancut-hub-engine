@@ -165,7 +165,7 @@ def _corte_agrupamento(cfg) -> float:
 def _provider_para(cfg):
     """Quem sabe o elenco desta mídia.
 
-    Anime pergunta pro AniList/Jikan; filme e série perguntam pro TMDB. Os
+    Anime pergunta pro AniList/MyAnimeList; filme e série perguntam pro TMDB. Os
     dois devolvem o MESMO `AnimeBundle`, então daqui pra baixo o pipeline não
     sabe (nem precisa saber) de onde veio.
     """
@@ -223,7 +223,7 @@ class Pipeline:
         #
         # Custa nada trocar a ordem: com o anime já conhecido esta etapa sai
         # do cache em ~0s (ver o disjuntor e o banco parcial na v1.8.1).
-        fonte = "TMDB" if cfg.media_kind == "live" else "AniList + Jikan"
+        fonte = "TMDB" if cfg.media_kind == "live" else "AniList + MyAnimeList"
         cb("fetch_characters", -1.0, f"Consultando {fonte}...")
         provider = _provider_para(cfg)
         # Ano e "é série?" só existem no TMDB — o AniList não tem onde pôr.
@@ -521,7 +521,7 @@ class Pipeline:
                 )
             else:
                 cause = (
-                    "Causa mais comum: as fontes de imagens (Jikan/MyAnimeList) "
+                    "Causa mais comum: as fontes de imagens (MyAnimeList/AniList) "
                     "estão instáveis ou fora do ar agora. O que fazer:\n"
                     "• Tente de novo mais tarde (os shots cortados ficam em cache, "
                     "a próxima rodada pula direto pro banco de personagens);\n"
@@ -2861,7 +2861,7 @@ class Pipeline:
             raise InsufficientRefsError(
                 "Nenhum personagem tem foto de referência — a IA não teria "
                 "nomes nem rostos pra comparar.\n\n"
-                "Causa mais comum: as fontes de imagens (Jikan/MyAnimeList) "
+                "Causa mais comum: as fontes de imagens (MyAnimeList/AniList) "
                 "estão instáveis ou fora do ar agora. Tente de novo mais "
                 "tarde (os shots cortados ficam em cache) ou adicione fotos "
                 "manualmente pela pasta de refs.\n\n"

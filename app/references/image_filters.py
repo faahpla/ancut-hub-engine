@@ -27,4 +27,12 @@ def is_monochrome(img_bgr: np.ndarray, saturation_threshold: float = 18.0) -> bo
     if img_bgr.ndim == 2:
         return True
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-    return float(hsv[:, :, 1].mean()) < saturation_threshold
+    s, v = hsv[:, :, 1], hsv[:, :, 2]
+    # Só o desenho conta, sem o fundo branco (ou preto) — do Dangai, 01/11. A
+    # média da imagem inteira jogava fora a arte oficial colorida em fundo
+    # branco: o perfil do Magna (Black Clover) dava 13,7 inteiro e 35,5 sem o
+    # fundo. Página de mangá continua perto de 0 dos dois jeitos.
+    desenho = ~(((v > 225) & (s < 30)) | (v < 30))
+    if desenho.mean() < 0.05:
+        return True  # quase só fundo: nada colorido pra contar
+    return float(s[desenho].mean()) < saturation_threshold
