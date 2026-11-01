@@ -597,8 +597,9 @@ def _shots(episode_id: int, character_id: int) -> None:
     cfg = Config.load()
     db = Database(cfg.cache_path / "index.db")
     if character_id == SEM_PERSONAGEM_ID:
+        palpites = db.sugestoes(episode_id)
         rows = [
-            {**r, "confidence": None, "approved": None}
+            {**r, "confidence": None, "approved": None, "sugestao": palpites.get(int(r["idx"]))}
             for r in db.shots_without_character(episode_id)
         ]
     elif character_id <= 0:
@@ -631,6 +632,7 @@ def _shots(episode_id: int, character_id: int) -> None:
                     "confidence": r["confidence"],
                     "approved": r["approved"],
                     "favorite": r["favorite"],
+                    "sugestao": r.get("sugestao"),
                 }
                 for r in rows
             ],
@@ -1130,6 +1132,64 @@ def _tag_shot(shot_ids: list[int], character_id: int, remover: bool) -> None:
         _emit({"type": "tag-shot", "error": str(e)})
         return
     _emit({"type": "tag-shot", **payload})
+
+
+def _tag_shot_new(shot_ids: list[int], nome: str) -> None:
+    """Marca as cenas com um personagem que ainda não existe (criado aqui)."""
+    from .config import Config
+    from .storage.db import Database
+    from .storage.marcar import ErroDeMarcacao, marcar_por_nome
+
+    cfg = Config.load()
+    db = Database(cfg.cache_path / "index.db")
+    try:
+        payload = marcar_por_nome(db, shot_ids, nome)
+    except ErroDeMarcacao as e:
+        _emit({"type": "tag-shot", "error": str(e)})
+        return
+    _emit({"type": "tag-shot", **payload})
+
+
+def _repescar(episode_ids: list[int]) -> None:
+    """Repescagem nos episódios já analisados (ver matching/repescagem.py)."""
+    from collections import Counter
+
+    from .config import Config
+    from .matching.ccip import CcipEngine
+    from .matching.repescagem import Repescador, anime_do_episodio, bloqueios, gravar
+    from .storage.db import Database
+
+    cfg = Config.load()
+    db = Database(cfg.cache_path / "index.db")
+    engine = CcipEngine()
+    if not engine.disponivel:
+        _emit({"type": "repescar-fim", "episodios": 0, "cenas": 0, "porPersonagem": {},
+               "erro": "A segunda IA (a que confere o rosto) não carregou. Ela baixa "
+                       "na primeira vez — confira a internet e tente de novo."})
+        return
+    por_nome: Counter = Counter()
+    feitos = 0
+    # Um Repescador por anime: o banco de rostos dele se monta uma vez só.
+    repescadores: dict[int, Repescador] = {}
+    for ep in episode_ids:
+        try:
+            anime_id = anime_do_episodio(db, ep)
+            if anime_id is None:
+                achadas = []
+            else:
+                if anime_id not in repescadores:
+                    repescadores[anime_id] = Repescador(db, anime_id, engine)
+                achadas, palpites = repescadores[anime_id].repescar(ep, bloqueios(db, ep))
+                gravar(db, ep, achadas, palpites, organizar=True)
+        except Exception as e:  # um episódio quebrado não para os outros
+            print(f"[repescar] episódio {ep}: {e}", file=sys.stderr, flush=True)
+            achadas = []
+        por_nome.update(a.nome for a in achadas)
+        feitos += 1
+        _emit({"type": "repescar-progresso", "feitos": feitos, "total": len(episode_ids),
+               "cenas": sum(por_nome.values())})
+    _emit({"type": "repescar-fim", "episodios": feitos, "cenas": sum(por_nome.values()),
+           "porPersonagem": dict(por_nome)})
 
 
 def _remove_character(episode_id: int, character_id: int) -> None:
@@ -1792,6 +1852,14 @@ def main(argv: list[str] | None = None) -> int:
                 int(args[2]),
                 remover=(len(args) > 3 and args[3] == "remove"),
             )
+            return 0
+        if mode == "repescar":
+            # repescar <id,id,...>
+            _repescar([int(x) for x in args[1].split(",") if x.strip()])
+            return 0
+        if mode == "tag-shot-new":
+            # tag-shot-new <id,id,...> <nome>
+            _tag_shot_new([int(x) for x in args[1].split(",") if x.strip()], args[2])
             return 0
         if mode == "characters":
             _characters(args[1] if len(args) > 1 else "")

@@ -34,6 +34,7 @@ from pathlib import Path
 
 from ..naming import find_token_match
 from .db import Database
+from .metadata_writer import atualizar_personagens_do_json
 from .organizer import organize_by_character, organize_by_pair, sanitize
 
 
@@ -68,6 +69,7 @@ def marcar_varias(
     """
     ultimo: dict = {}
     feitas = 0
+    episodios: set[int] = set()
     for sid in shot_ids:
         try:
             ultimo = marcar(db, sid, character_id, remover)
@@ -75,9 +77,36 @@ def marcar_varias(
         except ErroDeMarcacao:
             # Uma cena que sumiu no meio do caminho não derruba as outras.
             continue
+        cena = db.shot_context(sid)
+        if cena:
+            episodios.add(int(cena["episode_id"]))
     if not ultimo:
         raise ErroDeMarcacao("nenhuma das cenas existe mais")
+    # O Dangai lê o shots.json, não o banco: sem isto a marcação ficava só
+    # aqui. Uma vez por episódio, depois de todas as cenas.
+    for ep in episodios:
+        atualizar_personagens_do_json(db, ep)
     return {**ultimo, "count": feitas}
+
+
+def marcar_por_nome(db: Database, shot_ids: list[int], nome: str) -> dict:
+    """Marca as cenas com um personagem pelo NOME, criando-o se preciso.
+
+    O diálogo de marcar só listava quem já tinha alguma cena no acervo — e
+    personagem que o reconhecimento nunca achou (o Adam Smasher no Cyberpunk
+    do FAAH) não tinha como entrar. Agora o nome digitado vira personagem do
+    anime da cena (ou reusa o mesmo escrito de outro jeito) e marca.
+    """
+    nome = " ".join((nome or "").split())
+    if not nome:
+        raise ErroDeMarcacao("o nome está vazio")
+    cena = next((c for c in (db.shot_context(s) for s in shot_ids) if c), None)
+    if not cena:
+        raise ErroDeMarcacao("nenhuma das cenas existe mais")
+    cid = db.upsert_character(
+        anime_id=int(cena["anime_id"]), name=nome, anilist_id=None, mal_id=None, role="Main",
+    )
+    return marcar_varias(db, shot_ids, cid)
 
 
 def marcar(db: Database, shot_id: int, character_id: int, remover: bool = False) -> dict:
@@ -171,6 +200,7 @@ def remover_personagem(db: Database, episode_id: int, character_id: int) -> dict
         db.record_manual(episode_id, int(cena["idx"]), character_id, "block")
         if raiz and raiz.name:
             _desfazer_pasta(raiz, nome, Path(str(cena["file"] or "")).name)
+    atualizar_personagens_do_json(db, episode_id)
 
     return {"episodeId": episode_id, "characterId": character_id,
             "character": nome, "removed": len(cenas)}

@@ -1435,6 +1435,43 @@ class Pipeline:
                 saida.append(crops[bi])
         return saida
 
+    def _repescar(self, cb: ProgressCb, episode_id: int, benchmark: bool = False) -> None:
+        """Marca as cenas com rosto que ficaram sem ninguém, se for seguro.
+
+        Ver `matching/repescagem.py`. Sem o CCIP (não baixou, sem internet na
+        primeira vez) não faz nada: o CLIP sozinho erra demais nesta etapa.
+        """
+        from .matching.ccip import CcipEngine
+        from .matching.repescagem import Repescador, anime_do_episodio, bloqueios, gravar
+
+        cb("organize", -1.0, "Procurando personagem nas cenas sem ninguém...")
+        try:
+            if getattr(self, "_ccip_repescagem", None) is None:
+                engine = CcipEngine()
+                if not engine.disponivel:
+                    return
+                self._ccip_repescagem = engine
+            anime_id = anime_do_episodio(self.db, episode_id)
+            if anime_id is None:
+                return
+            rep = Repescador(self.db, anime_id, self._ccip_repescagem)
+            # No benchmark a curadoria é o gabarito: não entra (ver run()).
+            achadas, palpites = rep.repescar(
+                episode_id, set() if benchmark else bloqueios(self.db, episode_id)
+            )
+            gravar(self.db, episode_id, achadas, palpites, organizar=False)
+        except Exception as e:  # repescar é bônus: não derruba a análise
+            print(f"[CorteCenas] Repescagem falhou: {e}")
+            return
+        if achadas:
+            from collections import Counter as _Counter
+            por_nome = _Counter(a.nome for a in achadas)
+            print(
+                f"[CorteCenas] Repescagem: {len(achadas)} cenas marcadas — "
+                + ", ".join(f"{n}({c})" for n, c in por_nome.most_common())
+            )
+            cb("organize", -1.0, f"Repescagem: mais {len(achadas)} cenas com personagem")
+
     def _finalize_episode(
         self,
         *,
@@ -1455,24 +1492,41 @@ class Pipeline:
         merge_snapshot: list[dict] | None = None,
         benchmark: bool = False,
         weak_names: set[str] | None = None,
+        descoberta: bool = False,
     ) -> PipelineResult:
         """Shared end-of-pipeline stage for both CLIP and AI paths:
           - drop characters below min_shots_per_character (cleans DB too)
           - reapply the user's remembered manual curation (add/block)
+          - repescagem: cenas com rosto e sem ninguém (ver matching/repescagem)
           - write shots.json + characters.json
           - create by_character / by_pair hardlinks (from DB truth)
           - return PipelineResult
         """
         cfg = self.cfg
 
+        # Pouca cena só é sinal de engano quando NENHUMA delas é certeira. O
+        # corte cego tirava gente de verdade: Yoruichi, Aizen, Soi Fon, Nemu e
+        # Isane saíram de episódios do Bleach do FAAH por aparecerem em 2
+        # cenas — e personagem que aparece pouco é justamente o que ele mais
+        # precisa achar. E no Modo Descoberta não corta nunca: quem foi
+        # batizado ali foi a PESSOA que viu e deu o nome.
         from collections import Counter as _Counter
         char_counts = _Counter(n for names in per_shot_names for n in names)
+        certeza: dict[int, float] = {}
+        if not descoberta:
+            for assigns in self.db.assignments_for_episode(episode_id).values():
+                for a in assigns:
+                    certeza[a["id"]] = max(
+                        certeza.get(a["id"], 0.0), float(a["confidence"] or 0.0)
+                    )
         dropped: list[str] = []
         for name, count in char_counts.items():
-            if count >= cfg.min_shots_per_character:
+            if descoberta or count >= cfg.min_shots_per_character:
                 continue
             cid = name_to_id.get(name)
             if cid is None:
+                continue
+            if certeza.get(cid, 0.0) >= cfg.anchor_threshold:
                 continue
             self.db.drop_low_count_character(episode_id, cid)
             dropped.append(f"{name}({count})")
@@ -1557,6 +1611,10 @@ class Pipeline:
                 f"{n_block} remoções, {n_add} adições/movidas."
             )
             cb("organize", -1.0, f"Curadoria manual: {n_block + n_add} decisões reaplicadas")
+
+        # Depois da curadoria: o que a pessoa marcou entra no banco de rostos
+        # da repescagem, e o que ela tirou não volta.
+        self._repescar(cb, episode_id, benchmark)
 
         cb("organize", -1.0,
            "Lendo o resultado (sem mexer nas pastas)" if benchmark
@@ -2289,6 +2347,7 @@ class Pipeline:
             name_to_id=name_to_id,
             characters_json=chars_json,
             refs_dir=str(store.anime_dir(result.cache_id) / "characters"),
+            descoberta=True,
         )
 
     def _prepare_shots(

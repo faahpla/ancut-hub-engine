@@ -107,6 +107,18 @@ CREATE TABLE IF NOT EXISTS manual_override (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (episode_id, shot_idx, character_id)
 );
+
+-- Palpite da repescagem pra cena que ficou SEM NINGUÉM: parecido o bastante
+-- pra sugerir, não pra marcar sozinho. Aparece na lista "Sem personagem"
+-- como "Lucy?" e vira marcação com um clique. Presa ao número da cena, como
+-- a curadoria, e refeita inteira a cada repescagem do episódio.
+CREATE TABLE IF NOT EXISTS sugestao (
+    episode_id INTEGER NOT NULL REFERENCES episode(id) ON DELETE CASCADE,
+    shot_idx INTEGER NOT NULL,
+    character_id INTEGER NOT NULL REFERENCES character(id) ON DELETE CASCADE,
+    diferenca REAL NOT NULL,
+    PRIMARY KEY (episode_id, shot_idx)
+);
 """
 
 
@@ -910,6 +922,28 @@ class Database:
                 (episode_id,),
             ).fetchall()
             return [dict(r) for r in rows]
+
+    def gravar_sugestoes(
+        self, episode_id: int, palpites: list[tuple[int, int, float]]
+    ) -> None:
+        """Troca os palpites do episódio: [(shot_idx, character_id, diferença)]."""
+        with self.connect() as c:
+            c.execute("DELETE FROM sugestao WHERE episode_id = ?", (episode_id,))
+            c.executemany(
+                "INSERT OR REPLACE INTO sugestao(episode_id, shot_idx, character_id, diferenca) "
+                "VALUES(?,?,?,?)",
+                [(episode_id, int(i), int(cid), float(d)) for i, cid, d in palpites],
+            )
+
+    def sugestoes(self, episode_id: int) -> dict[int, dict]:
+        """{shot_idx: {id, name}} dos palpites do episódio."""
+        with self.connect() as c:
+            rows = c.execute(
+                "SELECT g.shot_idx, c.id, c.name FROM sugestao g "
+                "JOIN character c ON c.id = g.character_id WHERE g.episode_id = ?",
+                (episode_id,),
+            ).fetchall()
+        return {int(r["shot_idx"]): {"id": int(r["id"]), "name": str(r["name"])} for r in rows}
 
     def count_shots_without_character(self, episode_id: int) -> int:
         with self.connect() as c:
