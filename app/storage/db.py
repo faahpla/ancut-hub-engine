@@ -936,14 +936,20 @@ class Database:
             )
 
     def sugestoes(self, episode_id: int) -> dict[int, dict]:
-        """{shot_idx: {id, name}} dos palpites do episódio."""
+        """{shot_idx: {id, name, porFala}} dos palpites do episódio.
+        `porFala`: o palpite veio só da legenda (cena sem rosto em que essa
+        pessoa fala) — diferença 1,0 por convenção (ver repescagem)."""
         with self.connect() as c:
             rows = c.execute(
-                "SELECT g.shot_idx, c.id, c.name FROM sugestao g "
+                "SELECT g.shot_idx, g.diferenca, c.id, c.name FROM sugestao g "
                 "JOIN character c ON c.id = g.character_id WHERE g.episode_id = ?",
                 (episode_id,),
             ).fetchall()
-        return {int(r["shot_idx"]): {"id": int(r["id"]), "name": str(r["name"])} for r in rows}
+        return {
+            int(r["shot_idx"]): {"id": int(r["id"]), "name": str(r["name"]),
+                                 "porFala": float(r["diferenca"]) >= 1.0}
+            for r in rows
+        }
 
     def count_shots_without_character(self, episode_id: int) -> int:
         with self.connect() as c:

@@ -84,6 +84,8 @@ datas += [("app/assets/icon_32.png", "app/assets")]
 datas += [("app/assets/icon_16.png", "app/assets")]
 # Marca do cabeçalho (logo recortada, sem a margem do ícone quadrado).
 datas += [("app/assets/logo_header.png", "app/assets")]
+# Pesos da nota de beleza da busca por cena (LAION aesthetic v1, MIT).
+datas += [("app/assets/laion_estetica_l14.json", "app/assets")]
 datas += collect_data_files("open_clip")
 datas += collect_data_files("ultralytics")
 datas += collect_data_files("torchvision")

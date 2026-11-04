@@ -46,6 +46,16 @@ CLIP_CONCORDA = True
 NO_BANCO = 0.80
 DO_EPISODIO = 8
 DE_FORA = 16
+#: Quando quem o rosto aponta é quem ESTÁ FALANDO na cena (a legenda da
+#: Crunchyroll diz quem fala, ver falas.py), o rosto pode ter menos certeza.
+#: As duas provas são independentes — o rosto não sabe da legenda, e a
+#: legenda não sabe do rosto. Sozinha a legenda nunca marca: quem fala pode
+#: estar fora do quadro (no acervo do FAAH, só 64% a 87% das vezes ele está).
+#: Olhado no Black Clover S02E05 e no Apothecary: até 0,16 quase tudo certo;
+#: as duvidosas estavam acima disso ou com o CLIP discordando.
+ACEITA_FALANDO = 0.16
+#: Rosto + fala com o CLIP discordando: só com o rosto bem parecido.
+ACEITA_FALANDO_SEM_CLIP = 0.14
 #: Palpite (não marca, sugere na lista "Sem personagem"): o corte publicado
 #: do CCIP. Nessa faixa ele ainda acerta a maioria, mas não o bastante pra
 #: marcar sem alguém olhar.
@@ -124,6 +134,8 @@ class _Episodio:
     shots: dict[int, int]                 # shot_id -> idx
     tags: dict[int, set[int]]             # shot_id -> {character_id}
     feats: dict[str, tuple[np.ndarray, np.ndarray]]
+    tempos: dict[int, tuple[float, float]] | None = None   # shot_id -> (início, fim)
+    fonte: str = ""
 
     def rostos(self, sid: int):
         out = []
@@ -152,15 +164,18 @@ def _carregar_episodio(db, ep_id: int, raiz: Path) -> _Episodio | None:
     except Exception:
         return None
     with db.connect() as c:
-        shots = {int(r["id"]): int(r["idx"]) for r in c.execute(
-            "SELECT id, idx FROM shot WHERE episode_id=?", (ep_id,))}
+        linhas = c.execute(
+            "SELECT id, idx, start, end FROM shot WHERE episode_id=?", (ep_id,)).fetchall()
+        shots = {int(r["id"]): int(r["idx"]) for r in linhas}
+        tempos = {int(r["id"]): (float(r["start"] or 0), float(r["end"] or 0)) for r in linhas}
         tags: dict[int, set[int]] = defaultdict(set)
         for r in c.execute(
             "SELECT sc.shot_id, sc.character_id FROM shot_character sc "
             "JOIN shot s ON s.id = sc.shot_id WHERE s.episode_id=?", (ep_id,)
         ):
             tags[int(r["shot_id"])].add(int(r["character_id"]))
-    return _Episodio(ep_id, raiz, shots, tags, feats)
+        fonte = c.execute("SELECT source_file FROM episode WHERE id=?", (ep_id,)).fetchone()
+    return _Episodio(ep_id, raiz, shots, tags, feats, tempos, str(fonte[0] or "") if fonte else "")
 
 
 class Repescador:
@@ -289,6 +304,23 @@ class Repescador:
                 clip_b[cid] = np.stack([p[1] for p in par]).astype(np.float32)
         return ccip_b, clip_b
 
+    def _falantes(self, ep: _Episodio) -> dict[int, dict[int, float]]:
+        """{cena: {quem fala nela: segundos de fala}} pela legenda do
+        arquivo, se ela diz."""
+        if not ep.fonte or not ep.tempos or not self.nomes:
+            return {}
+        try:
+            from ..falas import falantes_por_cena, falas_do_episodio
+
+            falas = falas_do_episodio(ep.fonte, ep.raiz)
+            if not falas:
+                return {}
+            return falantes_por_cena(
+                falas, [(sid, a, b) for sid, (a, b) in ep.tempos.items()], self.nomes)
+        except Exception as e:  # noqa: BLE001 -- legenda é pista, não pode travar
+            print(f"[repescagem] legenda nao lida: {e}", flush=True)
+            return {}
+
     def repescar(
         self, ep_id: int, bloqueados: set[tuple[int, int]] | None = None
     ) -> tuple[list[Repescada], list[Palpite]]:
@@ -313,6 +345,7 @@ class Repescador:
             tudo = np.concatenate([ccip_b[c] for c in cids])
             dono = np.concatenate([[c] * len(ccip_b[c]) for c in cids])
 
+            falantes = self._falantes(ep)
             alvos: list[tuple[int, str, np.ndarray, np.ndarray]] = []   # sid, keyframe, box, clip
             for sid in ep.shots:
                 if ep.tags.get(sid):
@@ -320,7 +353,7 @@ class Repescador:
                 R = sorted(ep.rostos(sid), key=lambda r: -(float(r[1][2]) * float(r[1][3])))
                 for n, b, e in R[:ROSTOS_POR_CENA]:
                     alvos.append((sid, n, b, e))
-            if not alvos:
+            if not alvos and not falantes:
                 return [], []
             vets = self._vetores([(ep_id, n, b) for _, n, b, _ in alvos])
 
@@ -338,19 +371,43 @@ class Repescador:
                     continue
                 s1, c1 = sc[0]
                 s2 = sc[1][0] if len(sc) > 1 else 1.0
+                falam = falantes.get(sid, {})
                 if s1 <= PALPITE and (sid not in palpites or s1 < palpites[sid].diferenca):
                     palpites[sid] = Palpite(ep.shots[sid], c1, s1)
-                if s1 > ACEITA or s2 - s1 < FOLGA:
+                # O palpite prefere quem está falando, se o rosto não descarta
+                # essa pessoa (ela está entre as 3 mais parecidas e no corte).
+                for s_f, c_f in sc[:3]:
+                    if c_f in falam and c_f != c1 and s_f <= PALPITE and (
+                        sid not in palpites or palpites[sid].character_id not in falam
+                    ):
+                        palpites[sid] = Palpite(ep.shots[sid], c_f, s_f)
+                        break
+                pelo_rosto = s1 <= ACEITA and s2 - s1 >= FOLGA
+                # Rosto + fala já são duas provas que não sabem uma da outra:
+                # aqui o CLIP não precisa ser a terceira.
+                rosto_e_fala = c1 in falam and s1 <= ACEITA_FALANDO and s2 > s1
+                if not (pelo_rosto or rosto_e_fala):
                     continue
                 if CLIP_CONCORDA and f.size == clip_b[c1].shape[1]:
                     cl = max(
                         (float(np.sort(clip_b[c] @ f)[::-1][:3].mean()), c) for c in cids
                     )
-                    if cl[1] != c1:
+                    if cl[1] != c1 and not (rosto_e_fala and s1 <= ACEITA_FALANDO_SEM_CLIP):
                         continue
                 chave = (sid, c1)
                 if chave not in achadas or s1 < achadas[chave].diferenca:
                     achadas[chave] = Repescada(sid, ep.shots[sid], c1, self.nomes[c1], s1, s2 - s1)
+            # Cena SEM rosto em que alguém do elenco fala (de costas, plano
+            # aberto, silhueta): a legenda vira palpite — quem fala mais tempo
+            # nela. Nunca marca sozinha: quem fala pode estar fora do quadro.
+            com_rosto = {sid for sid, *_ in alvos}
+            for sid, falam in falantes.items():
+                if sid in palpites or sid in com_rosto or ep.tags.get(sid) or sid not in ep.shots:
+                    continue
+                for cid, _seg in sorted(falam.items(), key=lambda x: -x[1]):
+                    if (ep.shots[sid], cid) not in bloqueados and cid in self.nomes:
+                        palpites[sid] = Palpite(ep.shots[sid], cid, 1.0)
+                        break
             marcadas = {a.shot_id for a in achadas.values()}
             return (
                 sorted(achadas.values(), key=lambda a: a.shot_idx),

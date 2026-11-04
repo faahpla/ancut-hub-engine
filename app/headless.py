@@ -1210,6 +1210,40 @@ def _tag_shot_new(shot_ids: list[int], nome: str) -> None:
     _emit({"type": "tag-shot", **payload})
 
 
+def _cenas_buscar(pedido_json: str) -> None:
+    """Busca de cena por descrição (ver visao.py). Pedido em JSON:
+    {"consulta", "episodios": [ids], "ordem": "relevancia"|"beleza", "limite"}.
+
+    O que falta indexar no acervo é indexado aqui, com um evento por episódio.
+    """
+    from .config import Config
+    from .storage.db import Database
+    from .visao import buscar
+
+    pedido = json.loads(pedido_json)
+    cfg = Config.load()
+    db = Database(cfg.cache_path / "index.db")
+    modelo: dict = {}
+
+    def engine():
+        if "clip" not in modelo:
+            from .matching.embedding_engine import EmbeddingEngine
+
+            modelo["clip"] = EmbeddingEngine(model_name=cfg.clip_model, pretrained=cfg.clip_pretrained,
+                                             use_cuda=cfg.use_cuda)
+        return modelo["clip"]
+
+    r = buscar(
+        db, cfg.output_dir, [int(i) for i in pedido.get("episodios") or []],
+        str(pedido.get("consulta") or ""), str(pedido.get("ordem") or "relevancia"),
+        int(pedido.get("limite") or 300), engine,
+        lambda feitos, total: _emit({"type": "cenas-progresso", "feitos": feitos, "total": total}),
+    )
+    favoritas = db.favorite_shot_ids()
+    r["shots"] = [{**s, "favorite": s["id"] in favoritas} for s in r["shots"]]
+    _emit({"type": "cenas-resultado", "outputDir": str(cfg.output_dir), **r})
+
+
 def _repescar(episode_ids: list[int]) -> None:
     """Repescagem nos episódios já analisados (ver matching/repescagem.py)."""
     from collections import Counter
@@ -1942,6 +1976,10 @@ def main(argv: list[str] | None = None) -> int:
                 int(args[2]),
                 remover=(len(args) > 3 and args[3] == "remove"),
             )
+            return 0
+        if mode == "cenas-buscar":
+            # cenas-buscar <pedido em JSON>
+            _cenas_buscar(args[1])
             return 0
         if mode == "repescar":
             # repescar <id,id,...>

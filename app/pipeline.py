@@ -1653,6 +1653,21 @@ class Pipeline:
                 saida.append(crops[bi])
         return saida
 
+    def _indexar_cenas(self, cb: ProgressCb, episode_root: Path, cut_results: list) -> None:
+        """A busca de cena por descrição já sai pronta pra este episódio (ver
+        visao.py): o CLIP da análise ainda está carregado, e indexar agora
+        custa uns segundos — na busca, depois, seria esperar por ele."""
+        if self.cfg.media_kind == "live":
+            return
+        try:
+            from .visao import indexar
+
+            cb("organize", -1.0, "Preparando a busca por cena...")
+            get_engine, _ = self._lazy_models(_so_na_thread_principal(cb))
+            indexar(episode_root, [shot.idx for shot, _f, _k in cut_results], get_engine())
+        except Exception as e:  # noqa: BLE001 -- busca é bônus, não derruba a análise
+            print(f"[CorteCenas] Indice da busca por cena falhou: {e}", flush=True)
+
     def _repescar(self, cb: ProgressCb, episode_id: int, benchmark: bool = False) -> None:
         """Marca as cenas com rosto que ficaram sem ninguém, se for seguro.
 
@@ -1834,6 +1849,8 @@ class Pipeline:
         # Depois da curadoria: o que a pessoa marcou entra no banco de rostos
         # da repescagem, e o que ela tirou não volta.
         self._repescar(cb, episode_id, benchmark)
+        if not benchmark:
+            self._indexar_cenas(cb, episode_root, cut_results)
 
         cb("organize", -1.0,
            "Lendo o resultado (sem mexer nas pastas)" if benchmark
