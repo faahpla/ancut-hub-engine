@@ -15,6 +15,10 @@ Aqui a ausência passa a ser lida como decisão:
   personagem não está neste episódio". Aqui NÃO se decide sozinho: apagar
   uma pasta com 80 clipes é diferente demais de apagar três, e uma pasta
   pode sumir por acidente (recortar e colar no lugar errado). Vira pergunta.
+- **clipe APARECE em `by_character/Fulano/`** (arrastado ou copiado pra lá)
+  → "o Fulano está nesta cena". Vira marcação lembrada, igual à da tela; e
+  pasta com nome que o anime não conhece cria o personagem. Ideia do Corte
+  Cenas do Levi: marcar pelo Explorer, sem abrir o app.
 
 **Contra o falso positivo.** Se `shots/` ou `by_character/` não existem, ou
 se TODOS os clipes sumiram de uma vez, a leitura é abortada. Um HD externo
@@ -42,16 +46,21 @@ class Mudancas:
     pares_sumidos: list[dict] = field(default_factory=list)
     #: Personagens cuja pasta inteira sumiu — isto é pergunta, não decisão.
     pastas_sumidas: list[dict] = field(default_factory=list)
+    #: (cena, pasta de personagem) onde o clipe APARECEU: marcação nova.
+    pares_novos: list[dict] = field(default_factory=list)
     #: Pastas que existem mas cujos arquivos não reconhecemos (renomeados,
     #: copiados em vez de linkados). Ficam de fora da leitura, e isso é dito.
     ilegiveis: list[str] = field(default_factory=list)
     #: False = o disco não está em estado de ser lido. Nada deve ser aplicado.
     seguro: bool = True
     motivo: str = ""
+    anime_id: int | None = None
+    raiz: Path | None = None
 
     @property
     def vazio(self) -> bool:
-        return not (self.clipes_sumidos or self.pares_sumidos or self.pastas_sumidas)
+        return not (self.clipes_sumidos or self.pares_sumidos or self.pastas_sumidas
+                    or self.pares_novos)
 
     def payload(self) -> dict:
         return {
@@ -70,13 +79,18 @@ class Mudancas:
                 for f in self.pastas_sumidas
             ],
             "unreadableFolders": self.ilegiveis,
+            "newPairs": [
+                {"shotIdx": p["shot_idx"], "character": p["name"],
+                 "isNew": p["character_id"] is None}
+                for p in self.pares_novos
+            ],
         }
 
 
 def ler(episode_root: Path | str, db: Database, episode_id: int) -> Mudancas:
     """Compara o banco com o que está no disco agora."""
     raiz = Path(episode_root)
-    m = Mudancas()
+    m = Mudancas(raiz=raiz)
     _CACHE_INODES.clear()
 
     shots_dir = raiz / "shots"
@@ -151,7 +165,62 @@ def ler(episode_root: Path | str, db: Database, episode_id: int) -> Mudancas:
         else:
             m.pares_sumidos.extend(reg["faltando"])
 
+    m.anime_id, m.pares_novos = _pares_novos(raiz, chars_dir, db, episode_id, vivos, atribuicoes)
     return m
+
+
+def _pares_novos(raiz: Path, chars_dir: Path, db: Database, episode_id: int,
+                 vivos: dict, atribuicoes: dict) -> tuple[int | None, list[dict]]:
+    """Clipe que está numa pasta de personagem sem o banco ter aquele
+    personagem naquela cena.
+
+    O clipe é reconhecido pelo próprio arquivo (o hardlink que o app faz, ou
+    o arquivo arrastado de outra pasta do mesmo disco); cópia (Ctrl+C/Ctrl+V)
+    é outro arquivo, então vale também o mesmo NOME com o mesmo tamanho.
+    """
+    with db.connect() as c:
+        r = c.execute("SELECT anime_id FROM episode WHERE id=?", (episode_id,)).fetchone()
+    if r is None:
+        return None, []
+    anime_id = int(r["anime_id"])
+    por_inode: dict[tuple[int, int], dict] = {}
+    por_nome: dict[tuple[str, int], dict] = {}
+    for s in vivos.values():
+        try:
+            st = (raiz / s["file"]).stat()
+        except OSError:
+            continue
+        por_inode[(st.st_dev, st.st_ino)] = s
+        por_nome[(Path(s["file"]).name.lower(), st.st_size)] = s
+    tem: dict[int, set[str]] = {
+        sid: {sanitize(ch["name"]) for ch in chars} for sid, chars in atribuicoes.items()
+    }
+    elenco = {sanitize(str(ch["name"])): ch for ch in db.get_characters_for_anime(anime_id)}
+
+    novos: list[dict] = []
+    vistos: set[tuple[int, str]] = set()
+    for pasta in sorted(p for p in chars_dir.iterdir() if p.is_dir()):
+        for arq in pasta.iterdir():
+            if not arq.is_file() or arq.suffix.lower() != ".mp4":
+                continue
+            try:
+                st = arq.stat()
+            except OSError:
+                continue
+            shot = por_inode.get((st.st_dev, st.st_ino)) or por_nome.get((arq.name.lower(), st.st_size))
+            if shot is None or pasta.name in tem.get(shot["id"], set()):
+                continue
+            if (shot["id"], pasta.name) in vistos:
+                continue
+            vistos.add((shot["id"], pasta.name))
+            ch = elenco.get(pasta.name)
+            novos.append({
+                "shot_id": shot["id"],
+                "shot_idx": shot["idx"],
+                "character_id": int(ch["id"]) if ch else None,
+                "name": str(ch["name"]) if ch else pasta.name,
+            })
+    return anime_id, novos
 
 
 def _inodes(pasta: Path) -> set[tuple[int, int]]:
@@ -205,7 +274,22 @@ def aplicar(
     parte que este módulo se recusa a decidir sozinho.
     """
     if not mudancas.seguro:
-        return {"clips": 0, "pairs": 0, "characters": 0}
+        return {"clips": 0, "pairs": 0, "characters": 0, "added": 0}
+
+    # Adições ANTES das remoções (a ordem que o Levi aprendeu no Corte Cenas):
+    # quem arrastou a cena de uma pasta pra outra disse as duas coisas, e a
+    # marcação nova não pode depender do que a remoção mexe.
+    tocadas: set[int] = set()
+    for par in mudancas.pares_novos:
+        cid = par["character_id"]
+        if cid is None and mudancas.anime_id is not None:
+            cid = db.upsert_character(anime_id=mudancas.anime_id, name=par["name"],
+                                      anilist_id=None, mal_id=None, role="Main")
+        if cid is None:
+            continue
+        db.assign_character_manual(par["shot_id"], cid, 1.0)
+        db.record_manual(episode_id, par["shot_idx"], cid, "add", 1.0)
+        tocadas.add(par["shot_id"])
 
     n_clipes = 0
     if mudancas.clipes_sumidos:
@@ -236,8 +320,22 @@ def aplicar(
                 db.remove_shot_character(shot_id, pasta["id"])
             n_chars += 1
 
+    # As duplas (by_pair) da cena que ganhou alguém, e o shots.json — é dele
+    # que o Dangai lê quem está em cada cena.
+    if mudancas.raiz is not None:
+        from .metadata_writer import atualizar_personagens_do_json
+        from .organizer import refresh_shot_links
+
+        arquivos = {s["id"]: s["file"] for s in db.shots_for_episode(episode_id)}
+        for sid in tocadas:
+            if sid in arquivos:
+                nomes = [str(c["name"]) for c in db.characters_in_shot(sid)]
+                refresh_shot_links(mudancas.raiz, mudancas.raiz / arquivos[sid], nomes)
+        atualizar_personagens_do_json(db, episode_id)
+
     return {
         "clips": n_clipes,
         "pairs": len(mudancas.pares_sumidos),
         "characters": n_chars,
+        "added": len(tocadas),
     }

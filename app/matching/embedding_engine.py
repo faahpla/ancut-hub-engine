@@ -4,9 +4,30 @@ import io
 from pathlib import Path
 
 import numpy as np
-import open_clip
-import torch
 from PIL import Image
+
+# O torch e o open_clip sobem so quando um modelo e criado (ou
+# usado). Importar este arquivo (o pipeline importa) custava ~4,3 s de torch
+# ate para quem nao usa modelo nenhum -- o commit dos nomes do Reconhecer na
+# mao, por exemplo, que so mexe no banco e nas pastas.
+
+
+def _torch():
+    import torch
+
+    return torch
+
+
+def _sem_grad(f):
+    """O @torch.no_grad() de antes, sem importar o torch na definicao."""
+    import functools
+
+    @functools.wraps(f)
+    def embrulho(*a, **k):
+        with _torch().no_grad():
+            return f(*a, **k)
+
+    return embrulho
 
 
 class EmbeddingEngine:
@@ -24,6 +45,9 @@ class EmbeddingEngine:
         pretrained: str = "openai",
         use_cuda: bool = True,
     ) -> None:
+        import open_clip
+        import torch
+
         self.on_device_fallback: str | None = None
         self.model_name = model_name
         prefer_cuda = use_cuda and torch.cuda.is_available()
@@ -36,12 +60,24 @@ class EmbeddingEngine:
         # com QuickGELU) — degradando o reconhecimento. Forçamos pra manter a
         # consistência com o cache existente.
         force_quick_gelu = pretrained == "openai"
-        self.model, _, self.preprocess = open_clip.create_model_and_transforms(
-            model_name,
-            pretrained=pretrained,
-            device=self.device,
-            force_quick_gelu=force_quick_gelu,
-        )
+
+        def criar():
+            return open_clip.create_model_and_transforms(
+                model_name,
+                pretrained=pretrained,
+                device=self.device,
+                force_quick_gelu=force_quick_gelu,
+            )
+
+        # O peso ja baixado sobe sem perguntar nada a rede (hub_local);
+        # na 1a vez (ainda nao esta no cache) o bloco falha e baixa normalmente.
+        from ..hub_local import so_cache
+
+        try:
+            with so_cache():
+                self.model, _, self.preprocess = criar()
+        except Exception:
+            self.model, _, self.preprocess = criar()
         self.model.eval()
 
         if prefer_cuda:
@@ -55,7 +91,7 @@ class EmbeddingEngine:
             except Exception as e:
                 self._fallback_to_cpu(str(e))
 
-    @torch.no_grad()
+    @_sem_grad
     def embed_images(self, images: list[Image.Image | np.ndarray | Path | str]) -> np.ndarray:
         if not images:
             return np.zeros((0, self._dim()), dtype=np.float32)
@@ -67,9 +103,17 @@ class EmbeddingEngine:
             tensors.append(self.preprocess(pil))
         if not tensors:
             return np.zeros((0, self._dim()), dtype=np.float32)
-        return self._forward(torch.stack(tensors))
+        return self._forward(_torch().stack(tensors))
 
-    @torch.no_grad()
+    @_sem_grad
+    def embed_prontos(self, tensors: list) -> np.ndarray:
+        """Os vetores de tensores JA preparados (self.preprocess),
+        para quem prepara em paralelo. O mesmo _forward do embed_images."""
+        if not tensors:
+            return np.zeros((0, self._dim()), dtype=np.float32)
+        return self._forward(_torch().stack(tensors))
+
+    @_sem_grad
     def embed_texts(self, texts: list[str]) -> np.ndarray:
         """Frases no MESMO espaço das imagens (L2-normalizado).
 
@@ -79,20 +123,22 @@ class EmbeddingEngine:
         """
         if not texts:
             return np.zeros((0, self._dim()), dtype=np.float32)
+        import open_clip
+
         tokens = open_clip.get_tokenizer(self.model_name)(texts).to(self.device)
         feats = self.model.encode_text(tokens)
         feats = feats / feats.norm(dim=-1, keepdim=True).clamp(min=1e-8)
         return feats.detach().cpu().numpy().astype(np.float32)
 
-    @torch.no_grad()
-    def _forward(self, batch: torch.Tensor) -> np.ndarray:
+    @_sem_grad
+    def _forward(self, batch) -> np.ndarray:
         try:
             b = batch.to(self.device)
             feats = self.model.encode_image(b)
             feats = feats / feats.norm(dim=-1, keepdim=True).clamp(min=1e-8)
             arr = feats.detach().cpu().numpy().astype(np.float32)
             if self.device.type == "cuda":
-                torch.cuda.synchronize()
+                _torch().cuda.synchronize()
             return arr
         except Exception as e:
             if self.device.type == "cuda":
@@ -109,10 +155,10 @@ class EmbeddingEngine:
             f"({err.splitlines()[0]}). Usando CPU."
         )
         print(f"[CorteCenas] {self.on_device_fallback}")
-        self.device = torch.device("cpu")
+        self.device = _torch().device("cpu")
         self.model = self.model.to(self.device)
         try:
-            torch.cuda.empty_cache()
+            _torch().cuda.empty_cache()
         except Exception:
             pass
 

@@ -15,7 +15,11 @@ from .shot_detection import ShotBounds
 # Consumer GeForce cards cap concurrent NVENC sessions (3-8 depending on the
 # driver generation). 3 parallel encodes is safe everywhere and already keeps
 # the encode chip saturated for 1-4s clips.
-_NVENC_WORKERS = 3
+# 6. Os drivers de 2023 em diante liberam 8 sessoes na GeForce, e
+# o clipe curto passa mais tempo abrindo o processo e buscando o quadro do que
+# codificando: medido no Magic Repo Man (60 cenas), 3 = 190 ms/cena, 6 = 128.
+# Uma sessao recusada (limite do driver) tenta de novo antes de cair na CPU.
+_NVENC_WORKERS = 6
 # libx264 path: each ffmpeg spawns its own encoder threads, so a modest pool
 # is enough to keep every core busy without thrashing.
 _CPU_WORKERS = 4
@@ -113,6 +117,35 @@ def render_output_params(
     return p
 
 
+#: codecs que a GPU decodifica e que o NVENC recebe direto (8 bits 4:2:0).
+_GPU_CODECS = {"h264", "hevc"}
+_GPU_PIX_FMTS = {"yuv420p", "yuvj420p"}
+
+
+def fonte_na_gpu(video_path: str | Path) -> bool:
+    """o video pode ser decodificado na GPU (NVDEC) e ir direto ao
+    NVENC, sem passar pela CPU? So H.264/HEVC de 8 bits 4:2:0: o 10 bits viria
+    da GPU em p010, que o NVENC de H.264 nao recebe (a CPU converte para
+    yuv420p, como sempre). Medido: os quadros do clipe saem IDENTICOS (framemd5)
+    aos da decodificacao na CPU, e a CPU fica livre para os keyframes."""
+    from .ffmpeg_locate import ffprobe_binary
+
+    try:
+        r = subprocess.run(
+            [
+                ffprobe_binary(), "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=codec_name,pix_fmt",
+                "-of", "default=nw=1:nk=1", str(video_path),
+            ],
+            capture_output=True, text=True, timeout=30,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        linhas = [x.strip() for x in r.stdout.splitlines() if x.strip()]
+        return len(linhas) >= 2 and linhas[0] in _GPU_CODECS and linhas[1] in _GPU_PIX_FMTS
+    except Exception:
+        return False
+
+
 def cut_shot(
     video_path: str | Path,
     shot: ShotBounds,
@@ -122,6 +155,7 @@ def cut_shot(
     fps: float = 24.0,
     render_mode: str = "off",
     hdr: bool = False,
+    gpu_decode: bool = False,
 ) -> None:
     """Extract a shot to an mp4 file. Re-encode for frame accuracy, or stream-copy for speed.
 
@@ -137,6 +171,16 @@ def cut_shot(
             out_file.unlink()
         except OSError:
             pass
+    # o ffmpeg escreve num arquivo PARCIAL, que so vira o clipe
+    # quando ele termina. Com o app fechado (ou morto) no meio do corte, o
+    # clipe pela metade ficava com o nome final e tamanho > 0, e o corte
+    # retomado o reaproveitava como pronto (MP4 sem o moov, que nao abre).
+    # O clipe e o mesmo: as duas saidas ja pedem o muxer mp4 (-f mp4).
+    parcial = parcial_do_clipe(out_file)
+    try:
+        parcial.unlink(missing_ok=True)
+    except OSError:
+        pass
 
     # O "fim" do shot é o timestamp do PRIMEIRO frame do shot seguinte (fim
     # exclusivo, convenção do PySceneDetect). Cortar com "-to fim" na ENTRADA
@@ -151,21 +195,88 @@ def cut_shot(
         # Os parâmetros do encoder vêm de render_output_params (fonte única):
         # o merge de clipes usa a MESMA função, senão mesclar produziria um
         # formato diferente do corte e desfaria a garantia do modo.
-        stream = ffmpeg.input(str(video_path), ss=shot.start).output(
-            str(out_file),
+        params = render_output_params(render_mode, use_nvenc, hdr=hdr)
+        entrada: dict[str, object] = {}
+        if gpu_decode and use_nvenc and not hdr:
+            # decodifica na GPU e entrega o quadro ao NVENC sem
+            # copiar para a CPU. O pix_fmt sai do pedido: o quadro ja chega em
+            # nv12 (o 4:2:0 de 8 bits do yuv420p) e o clipe sai yuv420p igual.
+            entrada = {"hwaccel": "cuda", "hwaccel_output_format": "cuda"}
+            params = {k: v for k, v in params.items() if k != "pix_fmt"}
+        stream = ffmpeg.input(str(video_path), ss=shot.start, **entrada).output(
+            str(parcial),
             t=duration,
             loglevel="error",
-            **render_output_params(render_mode, use_nvenc, hdr=hdr),
+            **params,
         )
     else:
         stream = ffmpeg.input(str(video_path), ss=shot.start, to=shot.end).output(
-            str(out_file),
+            str(parcial),
             c="copy",
             format="mp4",
             avoid_negative_ts="make_zero",
             loglevel="error",
         )
-    run_ffmpeg_hidden(stream)
+    try:
+        run_ffmpeg_hidden(stream)
+        parcial.replace(out_file)
+    except BaseException:
+        try:
+            parcial.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def clipe_inteiro(arquivo: Path) -> bool:
+    """o MP4 terminou de ser escrito (tem a caixa moov)? Um clipe
+    de um ffmpeg morto no meio (antes do arquivo parcial, ou de outra versao)
+    tem o mdat e nao tem o moov: nao abre em lugar nenhum. Le so os
+    cabecalhos das caixas de cima (uns poucos bytes)."""
+    try:
+        tamanho = arquivo.stat().st_size
+        achou = False
+        with arquivo.open("rb") as f:
+            pos = 0
+            while pos + 8 <= tamanho:
+                f.seek(pos)
+                cab = f.read(16)
+                if len(cab) < 8:
+                    return False
+                n = int.from_bytes(cab[:4], "big")
+                achou = achou or cab[4:8] == b"moov"
+                if n == 1:  # tamanho de 64 bits
+                    if len(cab) < 16:
+                        return False
+                    n = int.from_bytes(cab[8:16], "big")
+                if n < 8:  # 0 = "ate o fim" (o mdat de um arquivo pela metade) ou torto
+                    return False
+                pos += n
+        # Inteiro: tem o moov e as caixas cobrem o arquivo certinho (cortado
+        # no meio, a ultima caixa promete mais bytes do que ha).
+        return achou and pos == tamanho
+    except OSError:
+        return False
+
+
+def jpg_inteiro(arquivo: Path) -> bool:
+    """o JPEG terminou de ser escrito (termina no FFD9)?"""
+    try:
+        with arquivo.open("rb") as f:
+            f.seek(0, 2)
+            if f.tell() < 4:
+                return False
+            f.seek(-2, 2)
+            return f.read(2) == bytes((0xFF, 0xD9))
+    except OSError:
+        return False
+
+
+def parcial_do_clipe(out_file: Path) -> Path:
+    """onde o ffmpeg escreve o clipe antes de ele ficar pronto
+    (0012.mp4 -> 0012.mp4.parcial). Nao termina em .mp4: quem lista os clipes
+    da pasta (a Biblioteca, o AnCut) nunca ve um pela metade."""
+    return out_file.with_name(out_file.name + ".parcial")
 
 
 def extract_keyframes(
@@ -379,6 +490,51 @@ def frame_numbers_for(shot: ShotBounds, fps: float, n_frames: int) -> list[int]:
     return [int((shot.start + shot.duration * o) * fps) for o in offsets]
 
 
+def _cortar_com_reserva(video_path, shot, out_file, reencode, video_fps, render_mode, hdr,
+                        enc_state: dict, falhas: dict) -> bool:
+    """corta UM clipe com as reservas em ordem: GPU decodificando +
+    NVENC -> CPU decodificando + NVENC (a mesma sessao, outra vez, se o driver
+    recusou uma sessao a mais) -> libx264. A GPU que falha 2 vezes sai para o
+    resto do episodio; o NVENC que falha 3 vezes seguidas tambem (era 1: com 6
+    sessoes, um "sem sessao livre" passageiro mandava o episodio inteiro para a
+    CPU). False = nem o libx264 cortou."""
+    import time as _time
+
+    if enc_state.get("gpu") and enc_state.get("nvenc"):
+        try:
+            cut_shot(video_path, shot, out_file, reencode=reencode, use_nvenc=True, fps=video_fps,
+                     render_mode=render_mode, hdr=hdr, gpu_decode=True)
+            return True
+        except ffmpeg.Error:
+            falhas["gpu"] += 1
+            if falhas["gpu"] >= 2 and enc_state.get("gpu"):
+                enc_state["gpu"] = False
+                print(f"[CorteCenas] decodificar na GPU falhou no shot {shot.idx} - "
+                      "decodificando na CPU (o NVENC continua)", flush=True)
+    for tentativa in range(2):
+        if not enc_state.get("nvenc"):
+            break
+        try:
+            cut_shot(video_path, shot, out_file, reencode=reencode, use_nvenc=True, fps=video_fps,
+                     render_mode=render_mode, hdr=hdr)
+            falhas["nvenc"] = 0
+            return True
+        except ffmpeg.Error:
+            if tentativa == 0:
+                _time.sleep(0.5)
+    if enc_state.get("nvenc"):
+        falhas["nvenc"] += 1
+        if falhas["nvenc"] >= 3:
+            enc_state["nvenc"] = False
+            print(f"[CorteCenas] NVENC falhou no shot {shot.idx} - continuando na CPU (libx264)", flush=True)
+    try:
+        cut_shot(video_path, shot, out_file, reencode=reencode, use_nvenc=False, fps=video_fps,
+                 render_mode=render_mode, hdr=hdr)
+        return True
+    except ffmpeg.Error:
+        return False
+
+
 def cut_all_shots(
     video_path: str | Path,
     shots: list[ShotBounds],
@@ -389,6 +545,7 @@ def cut_all_shots(
     on_progress: Callable[[int, int, int], None] | None = None,
     skip_existing: bool = True,
     render_mode: str = "off",
+    ao_ter_keyframes: Callable[[dict[int, list[Path]]], None] | None = None,
 ) -> list[tuple[ShotBounds, Path, list[Path]]]:
     """Cut shots and extract keyframes, several shots at a time.
 
@@ -408,6 +565,12 @@ def cut_all_shots(
     """
     shots_dir.mkdir(parents=True, exist_ok=True)
     keyframes_dir.mkdir(parents=True, exist_ok=True)
+    # clipes pela metade de um corte interrompido (cut_shot): fora.
+    for sobra in shots_dir.glob("*.mp4.parcial"):
+        try:
+            sobra.unlink()
+        except OSError:
+            pass
 
     # Clipe cortado noutro modo tem OUTRO formato, então reaproveitá-lo do
     # cache faria ligar a opção não mudar nada — o pior tipo de falha, a
@@ -478,6 +641,10 @@ def cut_all_shots(
     # remaining shots silently switch to libx264. Benign race — worst case a
     # couple extra NVENC attempts before every worker sees the flag.
     enc_state = {"nvenc": reencode and nvenc_available()}
+    # a GPU tambem decodifica (fonte_na_gpu); falhou duas vezes, a
+    # decodificacao volta para a CPU (o NVENC continua).
+    enc_state["gpu"] = bool(enc_state["nvenc"]) and not hdr and fonte_na_gpu(video_path)
+    falhas = {"gpu": 0, "nvenc": 0}
     workers = _NVENC_WORKERS if enc_state["nvenc"] else _CPU_WORKERS
     workers = max(1, min(workers, os.cpu_count() or 4, total or 1))
 
@@ -494,7 +661,7 @@ def cut_all_shots(
     faltando = [
         s for s in shots
         if refazer_kfs or not (skip_existing and all(
-            p.exists() and p.stat().st_size > 0 for p in esperados[s.idx]
+            jpg_inteiro(p) for p in esperados[s.idx]  # pela metade nao conta
         ))
     ]
     if refazer_kfs:
@@ -520,34 +687,48 @@ def cut_all_shots(
         else None
     )
 
+    # os keyframes ficam prontos bem antes dos clipes (a extracao
+    # le o video uma vez; o corte sao centenas de processos): avisa quem
+    # quer comecar o reconhecimento sem esperar o NVENC terminar.
+    def _avisar_keyframes(extraidos_agora: dict[int, list[Path]]) -> None:
+        if ao_ter_keyframes is None:
+            return
+        prontos: dict[int, list[Path]] = {}
+        for s_ in shots:
+            lista = extraidos_agora.get(s_.idx) or [
+                p for p in esperados[s_.idx] if jpg_inteiro(p)
+            ]
+            if lista:
+                prontos[s_.idx] = sorted(lista)
+        try:
+            ao_ter_keyframes(prontos)
+        except Exception as e:  # noqa: BLE001 -- o aviso nunca derruba o corte
+            print(f"[CorteCenas] aviso dos keyframes falhou: {e}", flush=True)
+
+    if kf_future is None:
+        _avisar_keyframes({})
+    else:
+        def _quando_extraiu(fut) -> None:
+            try:
+                _avisar_keyframes(fut.result())
+            except Exception:  # noqa: BLE001 -- extracao falhou: a analise le do disco depois
+                pass
+
+        kf_future.add_done_callback(_quando_extraiu)
+
     def process(shot: ShotBounds) -> tuple[ShotBounds, Path, list[Path], bool] | None:
         out_file = shots_dir / f"{shot.idx:04d}.mp4"
         expected_kfs = esperados[shot.idx]
 
-        have_cut = out_file.exists() and out_file.stat().st_size > 0
-        have_kfs = all(p.exists() and p.stat().st_size > 0 for p in expected_kfs)
+        # clipe ou keyframe pela metade (o app fechou no meio do
+        # corte) nao e reaproveitado: e refeito.
+        have_cut = out_file.exists() and out_file.stat().st_size > 0 and clipe_inteiro(out_file)
+        have_kfs = all(jpg_inteiro(p) for p in expected_kfs)
 
         if not (reuse_cuts and have_cut):
-            try:
-                cut_shot(video_path, shot, out_file, reencode=reencode,
-                         use_nvenc=enc_state["nvenc"], fps=video_fps,
-                         render_mode=render_mode, hdr=hdr)
-            except ffmpeg.Error:
-                if enc_state["nvenc"]:
-                    enc_state["nvenc"] = False
-                    print(
-                        f"[CorteCenas] NVENC falhou no shot {shot.idx} — "
-                        "continuando na CPU (libx264)",
-                        flush=True,
-                    )
-                    try:
-                        cut_shot(video_path, shot, out_file, reencode=reencode,
-                                 use_nvenc=False, fps=video_fps,
-                                 render_mode=render_mode, hdr=hdr)
-                    except ffmpeg.Error:
-                        return None
-                else:
-                    return None
+            if not _cortar_com_reserva(video_path, shot, out_file, reencode, video_fps,
+                                       render_mode, hdr, enc_state, falhas):
+                return None
 
         # Os keyframes desta cena talvez ainda estejam sendo extraídos na
         # outra thread — a lista definitiva é preenchida depois do join.

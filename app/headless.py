@@ -647,9 +647,10 @@ def _merge_shots(episode_id: int, shot_ids: list[int]) -> None:
     mesmo encoder com os mesmos parâmetros, então dá pra emendar os pacotes
     direto. Medido: 3 clipes em 542 ms, sem perda de qualidade.
 
-    Os pedaços saem de `shots/`, mas NÃO de `by_character/`. Aquelas entradas
-    são hardlinks pro mesmo arquivo, então o conteúdo sobrevive lá e a pasta
-    do personagem continua sendo o registro fiel do que a análise achou.
+    A cena juntada fica com TODOS os personagens das partes, e é ela que
+    passa a estar em `by_character/` e `by_pair/` (antes ela nascia sem
+    ninguém, e as partes ficavam nas pastas como o único registro). A junção
+    é anotada por tempo e sobrevive à reanálise (ver storage/juncoes.py).
     """
     import subprocess
     import tempfile
@@ -657,6 +658,7 @@ def _merge_shots(episode_id: int, shot_ids: list[int]) -> None:
     from .config import Config
     from .ffmpeg_locate import ffmpeg_binary
     from .storage.db import Database
+    from .storage.organizer import refresh_shot_links
 
     if len(shot_ids) < 2:
         _emit({"type": "failed", "message": "selecione pelo menos duas cenas"})
@@ -745,8 +747,20 @@ def _merge_shots(episode_id: int, shot_ids: list[int]) -> None:
         })
         return
 
+    # Quem estava nas partes, ANTES de apagá-las: a cena juntada fica com
+    # todos (a maior confiança de cada um). Antes ela nascia sem ninguém.
+    uniao: dict[int, dict] = {}
+    for r in escolhidos:
+        for c in db.characters_in_shot(r["id"]):
+            ant = uniao.get(int(c["id"]))
+            if ant is None or float(c["confidence"] or 0) > float(ant["confidence"] or 0):
+                uniao[int(c["id"])] = dict(c)
+
     removidos = 0
     for p in origens:
+        # Os hardlinks das partes nas pastas dos personagens e das duplas
+        # saem junto — o clipe juntado ganha os dele logo abaixo.
+        refresh_shot_links(episode_root, p, [])
         try:
             p.unlink()
             removidos += 1
@@ -762,6 +776,32 @@ def _merge_shots(episode_id: int, shot_ids: list[int]) -> None:
         start=primeiro["start"],
         end=primeiro["start"] + sum(r["duration"] for r in escolhidos),
     )
+    for cid, c in uniao.items():
+        db.merge_assignment(novo_id, cid, float(c["confidence"] or 0.0),
+                            reviewed=1 if c.get("approved") is not None else 0,
+                            approved=c.get("approved"))
+    if uniao:
+        refresh_shot_links(episode_root, destino, [str(c["name"]) for c in uniao.values()])
+
+    # Os quadros-chave da cena juntada saem do clipe NOVO, nas mesmas frações
+    # de sempre: os da 1ª parte mostravam só o começo, e os das outras
+    # partes não pertencem a cena nenhuma agora.
+    _keyframes_do_clipe(destino, episode_root / "keyframes", primeiro["idx"], cfg.keyframes_per_shot)
+    for r in escolhidos[1:]:
+        for k in (episode_root / "keyframes").glob(f"{r['idx']:04d}_*.jpg"):
+            k.unlink(missing_ok=True)
+
+    # A junção é anotada por TEMPO na pasta do episódio: a reanálise a
+    # reaplica em vez de devolver os pedaços (ver storage/juncoes.py).
+    from .storage import juncoes
+    from .storage.metadata_writer import atualizar_personagens_do_json
+
+    try:
+        juncoes.registrar(episode_root, primeiro["start"], ultimo["end"],
+                          primeiro["idx"], ultimo["idx"], destino.name)
+    except OSError as e:
+        print(f"[juntar] nao deu pra anotar a juncao: {e}", file=sys.stderr, flush=True)
+    atualizar_personagens_do_json(db, episode_id)
 
     _emit({
         "type": "merged",
@@ -771,6 +811,26 @@ def _merge_shots(episode_id: int, shot_ids: list[int]) -> None:
         "removed": removidos,
         "seconds": sum(r["duration"] for r in escolhidos),
     })
+
+
+def _keyframes_do_clipe(clipe: Path, pasta: Path, idx: int, n: int) -> None:
+    """Os N quadros-chave de uma cena tirados do próprio clipe (1/4, 1/2 e
+    3/4 com n=3, as mesmas frações do corte)."""
+    import cv2
+
+    cap = cv2.VideoCapture(str(clipe))
+    try:
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        if total <= 0:
+            return
+        fracoes = [0.5] if n <= 1 else [(i + 1) / (n + 1) for i in range(n)]
+        for k, f in enumerate(fracoes):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, min(int(total * f), total - 1))
+            ok, quadro = cap.read()
+            if ok:
+                cv2.imwrite(str(pasta / f"{idx:04d}_{k}.jpg"), quadro, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    finally:
+        cap.release()
 
 
 def _delete_shots(episode_id: int, shot_ids: list[int]) -> None:
@@ -1303,6 +1363,29 @@ def _delete_episode(episode_id: int, aplicar_agora: bool) -> None:
         except (OSError, ValueError):
             dentro = False
 
+    # Outro registro na MESMA pasta (o Levi achou com filme: sem SxxExx, cada
+    # grafia do título vira um "Episódio 01" e todos caem na mesma pasta).
+    # Apagar um levava os clipes que os outros ainda usam — e aqui não tem
+    # lixeira. Com dono sobrando, só o registro sai. Compara pelo `resolve()`:
+    # o Windows ignora ponto no fim do nome, então "Kiroku." e "Kiroku" são a
+    # mesma pasta com textos diferentes.
+    def _chave(p: Path) -> str:
+        try:
+            return str(p.resolve()).lower()
+        except OSError:
+            return str(p).lower()
+
+    outros: list[int] = []
+    if raiz.name:
+        alvo = _chave(raiz)
+        with db.connect() as c:
+            for o in c.execute(
+                "SELECT id, output_root FROM episode WHERE id != ? AND output_root IS NOT NULL",
+                (episode_id,),
+            ):
+                if _chave(Path(o["output_root"])) == alvo:
+                    outros.append(int(o["id"]))
+
     cenas = len(db.shots_for_episode(episode_id))
     bytes_ = 0
     if raiz.is_dir():
@@ -1319,7 +1402,7 @@ def _delete_episode(episode_id: int, aplicar_agora: bool) -> None:
 
     apagou = False
     if aplicar_agora and not erro:
-        if raiz.is_dir():
+        if raiz.is_dir() and not outros:
             try:
                 shutil.rmtree(raiz)
                 apagou = True
@@ -1350,6 +1433,7 @@ def _delete_episode(episode_id: int, aplicar_agora: bool) -> None:
         "shots": cenas,
         "bytes": bytes_,
         "folderDeleted": apagou,
+        "sharedWith": len(outros),
         "erro": erro,
     })
 
@@ -1775,6 +1859,12 @@ def _read_timings(episode_root: Path) -> dict[str, Any] | None:
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     mode = args[0] if args else "run"
+    # Antes de qualquer modo: o OpenCV não abre caminho com acento no Windows
+    # e falha calado (ver cv2_unicode). Todo o motor chama cv2.imread pelo
+    # atributo do módulo, então trocar aqui vale pra tudo.
+    from . import cv2_unicode
+
+    cv2_unicode.instalar()
     try:
         if mode == "probe":
             _probe()
