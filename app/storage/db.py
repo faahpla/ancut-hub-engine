@@ -94,6 +94,23 @@ CREATE TABLE IF NOT EXISTS favorite (
 
 CREATE INDEX IF NOT EXISTS idx_favorite_shot ON favorite(shot_id);
 
+-- Favoritos de um episódio que está sendo refeito.
+--
+-- Refazer a análise (ou o corte) apaga as cenas e cria outras, com ids
+-- novos — e o favorito, preso ao id da cena, ia junto em cascata. Foi assim
+-- que o Ajk perdeu os favoritos dele na 1.38.0, com a "Análise rápida"
+-- rodando por cima de episódios já prontos. Agora, antes de apagar, cada
+-- favorito é guardado aqui pelo MOMENTO do vídeo (o meio da cena), e volta
+-- sozinho pra cena nova que cobre aquele momento. Pelo momento e não pelo
+-- número da cena: se o corte mudar, o número muda, o momento não.
+CREATE TABLE IF NOT EXISTS favorito_guardado (
+    episode_id INTEGER NOT NULL REFERENCES episode(id) ON DELETE CASCADE,
+    meio REAL NOT NULL,
+    character_id INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMP,
+    PRIMARY KEY (episode_id, meio, character_id)
+);
+
 -- Curadoria manual do usuário (remover/mover/aprovar na aba Resultados).
 -- Presa ao NÚMERO da cena (shot_idx), não ao id da linha: a reanálise apaga
 -- e recria os shots, mas os números são estáveis (cache de detecção), então
@@ -803,7 +820,17 @@ class Database:
             return [dict(r) for r in rows]
 
     def clear_episode_shots(self, episode_id: int) -> None:
+        """Apaga as cenas do episódio pra serem refeitas — GUARDANDO os
+        favoritos antes (ver `favorito_guardado` no SCHEMA). `insert_shot`
+        devolve cada um pra cena nova que cobre o mesmo momento."""
         with self.connect() as c:
+            c.execute(
+                "INSERT OR IGNORE INTO favorito_guardado"
+                "(episode_id, meio, character_id, created_at) "
+                "SELECT s.episode_id, (s.start + s.end) / 2.0, f.character_id, f.created_at "
+                "FROM favorite f JOIN shot s ON s.id = f.shot_id WHERE s.episode_id = ?",
+                (episode_id,),
+            )
             c.execute("DELETE FROM shot WHERE episode_id=?", (episode_id,))
 
     # --- characters ---
@@ -891,7 +918,27 @@ class Database:
                 "VALUES(?,?,?,?,?,?,?)",
                 (episode_id, idx, file, keyframe, start, end, end - start),
             )
-            return cur.lastrowid
+            shot_id = cur.lastrowid
+            # Favorito guardado de quando este episódio foi refeito: volta pra
+            # cena que cobre o mesmo momento do vídeo.
+            faixa = (episode_id, start, end)
+            guardados = c.execute(
+                "SELECT character_id, created_at FROM favorito_guardado "
+                "WHERE episode_id=? AND meio >= ? AND meio < ?",
+                faixa,
+            ).fetchall()
+            for g in guardados:
+                c.execute(
+                    "INSERT OR IGNORE INTO favorite(shot_id, character_id, created_at) "
+                    "VALUES(?, ?, COALESCE(?, CURRENT_TIMESTAMP))",
+                    (shot_id, g["character_id"], g["created_at"]),
+                )
+            if guardados:
+                c.execute(
+                    "DELETE FROM favorito_guardado WHERE episode_id=? AND meio >= ? AND meio < ?",
+                    faixa,
+                )
+            return shot_id
 
     def delete_shots(self, shot_ids: list[int]) -> None:
         """Remove shots e, por ON DELETE CASCADE, as atribuições deles."""

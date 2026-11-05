@@ -411,6 +411,14 @@ def _recent() -> None:
         pass  # backfill é oportunista: falhar aqui não pode derrubar a lista
 
     from .storage.capas import marcadas_por_episodio
+    from .storage.copias import copia_do_dia
+
+    # A Biblioteca é a primeira coisa que o app abre: é a hora de guardar a
+    # cópia do dia, antes de qualquer análise mexer no banco.
+    try:
+        copia_do_dia(cfg.cache_path / "index.db")
+    except Exception:
+        pass  # sem espaço ou permissão: a lista não pode deixar de abrir
 
     marcadas = marcadas_por_episodio(db)
     episodes = []
@@ -2051,6 +2059,24 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if mode == "favorites":
             _favorites()
+            return 0
+        if mode == "resgatar-favoritos":
+            # resgatar-favoritos [apply] — ver storage/resgate_favoritos.py
+            from .config import Config
+            from .storage.copias import copia_do_dia
+            from .storage.db import Database
+            from .storage.resgate_favoritos import procurar
+
+            cfg = Config.load()
+            aplicar = len(args) > 1 and args[1] == "apply"
+            if aplicar:
+                # Antes de gravar, garante a cópia de hoje (se ainda não há).
+                try:
+                    copia_do_dia(cfg.cache_path / "index.db")
+                except Exception:
+                    pass
+            r = procurar(Database(cfg.cache_path / "index.db"), aplicar=aplicar)
+            _emit({"type": "resgatar-favoritos", **r.payload()})
             return 0
         if mode == "remove-character":
             _remove_character(int(args[1]), int(args[2]))
