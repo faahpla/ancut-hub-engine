@@ -410,6 +410,9 @@ def _recent() -> None:
     except Exception:
         pass  # backfill é oportunista: falhar aqui não pode derrubar a lista
 
+    from .storage.capas import marcadas_por_episodio
+
+    marcadas = marcadas_por_episodio(db)
     episodes = []
     # Sem limite: isto alimenta a Biblioteca, que é o acervo inteiro. Com o
     # corte de 30 que havia aqui, cada análise nova empurrava a mais antiga
@@ -434,9 +437,22 @@ def _recent() -> None:
                 "episodeRoot": str(root),
                 "shotCount": e["shot_count"],
                 "processedAt": e["processed_at"],
+                # A Biblioteca nova mostra imagem e quanto do episódio já tem
+                # gente marcada (ver storage/capas.py).
+                "cover": _capa_segura(db, e["id"], root),
+                "tagged": marcadas.get(int(e["id"]), 0),
             }
         )
     _emit({"type": "recent", "episodes": episodes, "missingFolders": sumidas})
+
+
+def _capa_segura(db, episode_id: int, root: Path) -> str:
+    from .storage.capas import capa_do_episodio
+
+    try:
+        return capa_do_episodio(db, episode_id, root)
+    except Exception:  # capa é enfeite: nunca derruba a Biblioteca
+        return ""
 
 
 def _cut_export_mode(episode_root: str | None) -> str:
@@ -1335,10 +1351,18 @@ def _characters(termo: str = "") -> None:
     cfg = Config.load()
     db = Database(cfg.cache_path / "index.db")
     grupos = listar(db, cfg.output_dir, termo)
+    # O rosto de cada um (storage/capas.py). Com orçamento de tempo: o que
+    # não deu desta vez sai na próxima abertura.
+    try:
+        from .storage.capas import avatares
+
+        rostos = avatares(db, grupos, cfg.cache_path / "avatares")
+    except Exception:
+        rostos = {}
     _emit({
         "type": "characters",
         "outputDir": str(cfg.output_dir),
-        "characters": [g.payload() for g in grupos],
+        "characters": [{**g.payload(), "avatar": rostos.get(min(g.ids), "")} for g in grupos],
     })
 
 
