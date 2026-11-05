@@ -73,9 +73,15 @@ class EpisodeInfo:
     #: Vazio = decide o motor (memória de pastas → nome digitado). Ver
     #: `storage/anime_folders.py`.
     output_folder: str = ""
+    #: B-roll: o título do vídeo ("Official Launch Trailer") e o link de
+    #: onde ele veio. Só valem pra `kind == "BROLL"`.
+    titulo: str = ""
+    origem: str = ""
 
     @property
     def slug(self) -> str:
+        if self.kind == "BROLL":
+            return pasta_do_broll(self.episode, self.titulo)
         # Filme não tem temporada nem episódio, e "S01-MOVIE1" seria inventar
         # uma numeração. O ANO é o que distingue de verdade — e é o que
         # permite quatro John Wick na mesma pasta da franquia sem colidir.
@@ -84,6 +90,25 @@ class EpisodeInfo:
         if self.kind:
             return f"S{self.season:02d}-{self.kind}{self.episode}"
         return f"S{self.season:02d}E{self.episode:02d}"
+
+
+_PROIBIDO_NO_WINDOWS = re.compile(r'[<>"/\\|?*\x00-\x1f]')
+
+
+def pasta_do_broll(numero: int, titulo: str = "") -> str:
+    """Nome da pasta de um B-roll: "B-roll 03 - Official Launch Trailer".
+
+    O número vem na frente porque é ele que dá identidade (a chave do banco
+    é anime+temporada+número+tipo) e ordena na ordem em que foram baixados;
+    o título vem depois porque é o que a pessoa procura no Explorer.
+    """
+    base = f"B-roll {numero:02d}"
+    t = (titulo or "").replace(":", " -")
+    t = _PROIBIDO_NO_WINDOWS.sub(" ", t)
+    t = re.sub(r"\s+", " ", t).strip()[:80]
+    # O Windows não aceita pasta terminando em ponto ou espaço.
+    t = t.rstrip(". ")
+    return f"{base} - {t}" if t else base
 
 
 def parse_mmss(text: str) -> float:

@@ -210,6 +210,15 @@ class Database:
         if "kind" not in cols:
             Database._backup_before_rebuild(c)
             Database._migrate_episode_kind(c)
+        # B-roll (trailer, gameplay, teaser baixado por link): não tem
+        # temporada nem episódio que signifique alguma coisa, então quem dá
+        # nome é o TÍTULO do vídeo, e `origem` guarda de onde ele veio (o
+        # link) — é o que deixa baixar o mesmo trailer de novo cair na mesma
+        # vaga em vez de virar um B-roll repetido.
+        if "titulo" not in cols:
+            c.execute("ALTER TABLE episode ADD COLUMN titulo TEXT")
+        if "origem" not in cols:
+            c.execute("ALTER TABLE episode ADD COLUMN origem TEXT")
 
     @staticmethod
     def _backup_before_rebuild(c: sqlite3.Connection) -> None:
@@ -658,7 +667,8 @@ class Database:
         marcas = ",".join("?" * len(ids))
         with self.connect() as c:
             rows = c.execute(
-                f"SELECT id, anime_id, season, episode, kind, output_root "
+                f"SELECT id, anime_id, season, episode, kind, output_root, "
+                f"       source_file, titulo, origem "
                 f"FROM episode WHERE id IN ({marcas})",
                 tuple(ids),
             ).fetchall()
@@ -699,6 +709,29 @@ class Database:
             except sqlite3.OperationalError:
                 pass  # banco anterior a esta tabela
             c.execute("DELETE FROM episode WHERE id=?", (episode_id,))
+
+    def set_episode_broll(self, episode_id: int, titulo: str, origem: str) -> None:
+        """Título e link de origem de um B-roll. Vazio não apaga o que havia:
+        recortar um B-roll a partir do arquivo não pode esquecer de onde ele
+        veio."""
+        with self.connect() as c:
+            if titulo:
+                c.execute("UPDATE episode SET titulo=? WHERE id=?", (titulo, episode_id))
+            if origem:
+                c.execute("UPDATE episode SET origem=? WHERE id=?", (origem, episode_id))
+
+    def brolls_na_pasta(self, pasta_anime: str) -> list[dict]:
+        """B-rolls cuja pasta fica dentro desta pasta de anime."""
+        alvo = str(Path(pasta_anime)).lower()
+        with self.connect() as c:
+            rows = c.execute(
+                "SELECT id, anime_id, episode, titulo, origem, output_root FROM episode "
+                "WHERE kind='BROLL' AND output_root IS NOT NULL"
+            ).fetchall()
+        return [
+            dict(r) for r in rows
+            if str(Path(r["output_root"]).parent).lower() == alvo
+        ]
 
     def set_episode_season(self, episode_id: int, season: int) -> None:
         with self.connect() as c:
@@ -754,6 +787,7 @@ class Database:
         """
         sql = (
             "SELECT e.id, e.season, e.episode, e.kind, e.output_root, e.processed_at, "
+            "       e.titulo, e.origem, "
             "       a.title AS anime_title, "
             "       (SELECT COUNT(*) FROM shot s WHERE s.episode_id = e.id) AS shot_count "
             "FROM episode e JOIN anime a ON a.id = e.anime_id "

@@ -441,6 +441,9 @@ def _recent() -> None:
                 # gente marcada (ver storage/capas.py).
                 "cover": _capa_segura(db, e["id"], root),
                 "tagged": marcadas.get(int(e["id"]), 0),
+                # B-roll: nome e link do vídeo (ver storage/broll.py).
+                "titulo": e.get("titulo") or "",
+                "origem": e.get("origem") or "",
             }
         )
     _emit({"type": "recent", "episodes": episodes, "missingFolders": sumidas})
@@ -489,7 +492,7 @@ def _results(episode_id: int) -> None:
     with db.connect() as c:
         ep = c.execute(
             "SELECT e.id, e.season, e.episode, e.kind, e.output_root, e.anime_id, "
-            "       e.source_file, "
+            "       e.source_file, e.titulo, e.origem, "
             "       a.title AS anime_title, a.anilist_id, a.mal_id "
             "FROM episode e JOIN anime a ON a.id = e.anime_id WHERE e.id=?",
             (episode_id,),
@@ -516,6 +519,8 @@ def _results(episode_id: int) -> None:
             "season": ep["season"],
             "episode": ep["episode"],
             "kind": ep["kind"],
+            "titulo": ep["titulo"] or "",
+            "origem": ep["origem"] or "",
             "episodeRoot": ep["output_root"],
             "totalShots": len(db.shots_for_episode(episode_id)),
             # Quantas cenas ficaram sem ninguém. Vai junto pra a lista poder
@@ -1670,6 +1675,58 @@ def _result_payload(result: Any) -> dict[str, Any]:
     }
 
 
+def _numerar_broll(cfg, info) -> None:
+    """Escolhe a vaga do B-roll ANTES do pipeline, que monta a pasta com ela.
+
+    - número 0 = B-roll novo: o próximo livre na pasta do título (ou a vaga
+      do mesmo link, se ele já foi baixado antes);
+    - número dado sem título = recorte/identificação de um B-roll que já
+      existe: o título vem do banco, senão a pasta "B-roll 03 - Trailer"
+      viraria uma "B-roll 03" nova ao lado dela.
+    """
+    from .storage.anime_folders import AnimeFolderStore
+    from .storage.broll import numero_para
+    from .storage.db import Database
+    from .storage.organizer import sanitize
+
+    pastas = AnimeFolderStore(cfg.cache_path)
+    pasta = pastas.decide(
+        typed=info.anime,
+        explicit=info.output_folder,
+        franchise_key=pastas.franchise_for_name(info.anime, info.season, cfg.cache_path),
+    )
+    pasta_anime = cfg.output_path / (pasta or sanitize(info.anime))
+    db = Database(cfg.cache_path / "index.db")
+    info.season = 1
+    if info.episode <= 0:
+        info.episode = numero_para(db, pasta_anime, info.origem)
+    if not info.titulo or not info.origem:
+        for r in db.brolls_na_pasta(str(pasta_anime)):
+            if int(r["episode"]) == info.episode:
+                info.titulo = info.titulo or (r.get("titulo") or "")
+                info.origem = info.origem or (r.get("origem") or "")
+                break
+
+
+def _to_broll(ids: list[int], aplicar_agora: bool, titulos_json: str = "") -> None:
+    """Passa episódios já cortados pra B-roll. Ver storage/broll.py."""
+    from .config import Config
+    from .storage.broll import converter, planejar_conversao
+    from .storage.db import Database
+
+    cfg = Config.load()
+    db = Database(cfg.cache_path / "index.db")
+    titulos: dict[int, str] = {}
+    if titulos_json:
+        try:
+            bruto = json.loads(Path(titulos_json).read_text(encoding="utf-8"))
+            titulos = {int(k): str(v) for k, v in bruto.items() if str(v).strip()}
+        except (OSError, ValueError):
+            titulos = {}
+    plano = (converter if aplicar_agora else planejar_conversao)(db, ids, titulos)
+    _emit({"type": "to-broll", "aplicado": aplicar_agora and plano.pode, **plano.payload()})
+
+
 def _run() -> int:
     req = _read_request()
     # Depois de ter a requisição, ninguém mais deve enxergar o pipe como
@@ -1701,11 +1758,15 @@ def _run() -> int:
         # um valor desconhecido não pode virar identidade em silêncio.
         kind=(
             str(req.get("kind", "")).upper()
-            if req.get("kind") in ("OP", "ED", "MOVIE")
+            if req.get("kind") in ("OP", "ED", "MOVIE", "BROLL")
             else ""
         ),
         output_folder=str(req.get("outputFolder", "") or ""),
+        titulo=str(req.get("titulo", "") or "").strip(),
+        origem=str(req.get("origem", "") or "").strip(),
     )
+    if info.kind == "BROLL":
+        _numerar_broll(cfg, info)
 
     import time
 
@@ -2037,6 +2098,14 @@ def main(argv: list[str] | None = None) -> int:
                 int(args[2]),
                 args[3],
                 aplicar_agora=(len(args) > 4 and args[4] == "apply"),
+            )
+            return 0
+        if mode == "to-broll":
+            # to-broll <id,id,...> [apply] [titulos.json]
+            _to_broll(
+                [int(x) for x in args[1].split(",") if x.strip()],
+                aplicar_agora=(len(args) > 2 and args[2] == "apply"),
+                titulos_json=(args[3] if len(args) > 3 else ""),
             )
             return 0
         if mode == "merge-anime":

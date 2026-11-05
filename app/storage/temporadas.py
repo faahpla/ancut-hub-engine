@@ -25,8 +25,14 @@ from pathlib import Path
 from .db import Database
 
 
-def slug(season: int, episode: int, kind: str = "") -> str:
+def slug(season: int, episode: int, kind: str = "", titulo: str = "") -> str:
     """Nome da pasta do episódio. Espelha `EpisodeInfo.slug` do motor."""
+    if kind == "BROLL":
+        from ..video_ingest import pasta_do_broll
+
+        return pasta_do_broll(episode, titulo)
+    if kind == "MOVIE":
+        return f"Filme ({episode})" if episode > 1900 else "Filme"
     s = f"S{season:02d}"
     if kind:
         return f"{s}-{kind}{episode}"
@@ -103,6 +109,11 @@ def planejar(episode_ids: list[int], nova_temporada: int, db: Database) -> Plano
             plano.conflitos.append(f"episódio {r['id']} sem pasta gravada")
             continue
         kind = r["kind"] or ""
+        # B-roll não pertence a temporada nenhuma: mudar "a temporada
+        # inteira" não pode renomear o trailer que só divide o número 1 com
+        # ela. Filme também não tem temporada no nome da pasta.
+        if kind in ("BROLL", "MOVIE"):
+            continue
         alvo = raiz.parent / slug(nova_temporada, r["episode"], kind)
 
         if int(r["season"]) == nova_temporada:

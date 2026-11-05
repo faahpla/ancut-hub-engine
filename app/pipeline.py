@@ -542,6 +542,9 @@ class Pipeline:
         # depois sem reanalisar (reconstruir o caminho dependia do nome que o
         # usuário digitou, que não fica salvo em lugar nenhum).
         self.db.set_episode_root(episode_id, str(episode_root))
+        if info.kind == "BROLL":
+            # Nome e link do vídeo (ver storage/broll.py).
+            self.db.set_episode_broll(episode_id, info.titulo, info.origem)
 
         # Modo "adicionar" da reanálise: fotografa as atribuições atuais
         # ANTES de limpar — elas voltam por cima do resultado novo no final
@@ -2031,6 +2034,9 @@ class Pipeline:
             root=str(episode_root),
         )
         self.db.set_episode_root(episode_id, str(episode_root))
+        if info.kind == "BROLL":
+            # Nome e link do vídeo (ver storage/broll.py).
+            self.db.set_episode_broll(episode_id, info.titulo, info.origem)
         self.db.clear_episode_shots(episode_id)
 
         cb("organize", -1.0, "Gravando as cenas...")
@@ -2270,6 +2276,9 @@ class Pipeline:
         # resultados caía na análise anterior como se a nova nunca tivesse
         # existido.
         self.db.set_episode_root(episode_id, str(episode_root))
+        if info.kind == "BROLL":
+            # Nome e link do vídeo (ver storage/broll.py).
+            self.db.set_episode_broll(episode_id, info.titulo, info.origem)
         self.db.clear_episode_shots(episode_id)
 
         observations: list[FaceObservation] = []
