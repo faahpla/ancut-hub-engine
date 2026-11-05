@@ -191,6 +191,35 @@ def _noop(stage: str, frac: float, msg: str) -> None:
     pass
 
 
+#: Teto de rostos de batismo por personagem. Somando 10 por episódio, sem
+#: teto um protagonista de 24 episódios teria 240 — mais tempo de análise e
+#: nenhum ganho depois de umas dezenas de ângulos diferentes.
+TETO_BATISMOS = 40
+
+
+def _podar_batismos(pasta: Path, manter: set[Path]) -> None:
+    """Tira os rostos de batismo mais ANTIGOS acima do teto.
+
+    Só mexe em `auto_disc_*`, que é o que o próprio batismo grava: foto
+    posta à mão e as do AniList não são dele pra apagar. Os do batismo que
+    acabou de acontecer (`manter`) nunca saem.
+    """
+    try:
+        fotos = sorted(
+            (p for p in pasta.glob("auto_disc_*.jpg") if p not in manter),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return
+    sobra = TETO_BATISMOS - len(manter)
+    for p in fotos[max(sobra, 0):]:
+        try:
+            p.unlink()
+        except OSError:
+            pass
+
+
 def _so_na_thread_principal(cb: ProgressCb) -> ProgressCb:
     """o aviso dos modelos ("Baixando modelo CLIP...") vai para a
     tela so quando vem da thread principal; da previa (por tras, durante o
@@ -2573,6 +2602,11 @@ class Pipeline:
 
             d = store.character_dir(result.cache_id, name)
             d.mkdir(parents=True, exist_ok=True)
+            # Os rostos de cada batismo SOMAM, com o episódio no nome. Antes
+            # eram sempre "auto_disc_00..09": o episódio novo sobrescrevia o
+            # anterior, e o app nunca ficava melhor em reconhecer — o pedido
+            # do Levi foi justamente "batizou uma vez, o app tem que saber".
+            # Rebatizar o MESMO episódio sobrescreve só os dele.
             paths: list[Path] = []
             for g in gs:
                 skip = set(removed.get(g.key) or [])
@@ -2581,9 +2615,10 @@ class Pipeline:
                         continue
                     if len(paths) >= 10:
                         break
-                    p = d / f"auto_disc_{len(paths):02d}.jpg"
+                    p = d / f"auto_disc_e{result.episode_id}_{len(paths):02d}.jpg"
                     p.write_bytes(jpg)
                     paths.append(p)
+            _podar_batismos(d, manter=set(paths))
             refs_per_char[name] = paths
 
             cents = np.stack([from_bytes(g.centroid_bytes) for g in gs])
