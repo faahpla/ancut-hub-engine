@@ -421,6 +421,8 @@ def _recent() -> None:
         pass  # sem espaço ou permissão: a lista não pode deixar de abrir
 
     marcadas = marcadas_por_episodio(db)
+    from .storage.metadata_writer import marcar_broll_no_json
+
     episodes = []
     # Sem limite: isto alimenta a Biblioteca, que é o acervo inteiro. Com o
     # corte de 30 que havia aqui, cada análise nova empurrava a mais antiga
@@ -429,6 +431,13 @@ def _recent() -> None:
     sumidas = 0
     for e in db.recent_episodes():
         root = Path(e["output_root"])
+        if e.get("kind") == "BROLL" and root.is_dir():
+            # B-roll de antes da marca no shots.json (motor 0.24.0/0.24.1):
+            # acerta aqui, uma vez, pro Dangai parar de vê-lo como S01E0N.
+            try:
+                marcar_broll_no_json(root / "metadata" / "shots.json", e.get("titulo") or "")
+            except Exception:
+                pass
         if not root.is_dir():
             # Pasta apagada por fora: não oferece o que não abre. Mas CONTA,
             # pra a tela poder dizer que existem — desaparecer calado é o que

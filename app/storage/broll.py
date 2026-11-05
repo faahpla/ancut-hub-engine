@@ -27,6 +27,7 @@ from pathlib import Path
 
 from ..video_ingest import pasta_do_broll
 from .db import Database
+from .metadata_writer import marcar_broll_no_json
 
 # "Nome do vídeo [dQw4w9WgXcQ]" — o id de 11 caracteres que o yt-dlp põe no
 # nome do arquivo quando baixa do YouTube.
@@ -216,4 +217,6 @@ def converter(
     )
     for m in feitas:
         db.set_episode_broll(m.episode_id, m.titulo, m.origem)
+        # A ficha que o Dangai lê também passa a dizer que é B-roll.
+        marcar_broll_no_json(Path(m.para_pasta) / "metadata" / "shots.json", m.titulo)
     return plano

@@ -93,9 +93,11 @@ def build_shot_payload(
     season: int,
     episode: int,
     characters: list[dict],
+    kind: str = "",
+    titulo: str = "",
 ) -> dict:
     pairs = _pares([c["name"] for c in characters])
-    return {
+    payload = {
         "shot_id": f"{shot['idx']:04d}",
         "file": shot["file"],
         "keyframe": shot.get("keyframe"),
@@ -110,3 +112,35 @@ def build_shot_payload(
         "season": season,
         "episode": episode,
     }
+    if kind == "BROLL":
+        # O Dangai lê este arquivo, não o banco: sem a marca, o "B-roll 01"
+        # chegava lá como S01E01 e o recap usava cena de trailer como se
+        # fosse do episódio 1. Ver `marcar_broll_no_json`.
+        payload["kind"] = "BROLL"
+        payload["titulo"] = titulo
+    return payload
+
+
+def marcar_broll_no_json(shots_json: Path, titulo: str) -> bool:
+    """Põe a marca de B-roll num shots.json que já existe.
+
+    Pra B-roll feito antes da marca existir (motor 0.24.0/0.24.1) e pra
+    episódio que virou B-roll pelo "Passar pra B-roll". Devolve True se
+    mudou alguma coisa. Só acrescenta campos: o resto (personagens marcados
+    à mão, cenas juntadas) fica como está.
+    """
+    try:
+        cenas = json.loads(shots_json.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(cenas, list):
+        return False
+    mudou = False
+    for c in cenas:
+        if isinstance(c, dict) and (c.get("kind") != "BROLL" or c.get("titulo") != titulo):
+            c["kind"] = "BROLL"
+            c["titulo"] = titulo
+            mudou = True
+    if mudou:
+        write_shots_json(shots_json, cenas)
+    return mudou

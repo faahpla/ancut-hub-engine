@@ -1929,7 +1929,10 @@ class Pipeline:
                 "end": shot.end,
             }
             shots_payload.append(
-                build_shot_payload(shot_row, bundle.title, info.season, info.episode, assigns)
+                build_shot_payload(
+                    shot_row, bundle.title, info.season, info.episode, assigns,
+                    kind=info.kind, titulo=info.titulo,
+                )
             )
             if names and not benchmark:
                 organize_by_character(shot_file, episode_root, names)
@@ -2093,6 +2096,7 @@ class Pipeline:
                         "end": shot.end,
                     },
                     info.anime, info.season, info.episode, [],
+                    kind=info.kind, titulo=info.titulo,
                 )
             )
         write_shots_json(metadata_dir / "shots.json", payload)
@@ -2669,10 +2673,15 @@ class Pipeline:
              Path(s.file), [Path(k) for k in s.keyframes])
             for s in result.shots
         ]
+        linha = next(iter(self.db.episodes_by_ids([result.episode_id])), None) or {}
         info = EpisodeInfo(
             anime=result.anime_title, season=result.season,
             episode=result.episode,
             source=Path(result.shots[0].file) if result.shots else Path("."),
+            # B-roll: sem isto a ficha do batismo sairia sem a marca de B-roll.
+            kind=str(linha.get("kind") or ""),
+            titulo=str(linha.get("titulo") or ""),
+            origem=str(linha.get("origem") or ""),
         )
         # Ponte verde→batismo: o commit roda DEPOIS de uma análise completa,
         # e o characters.json existente carrega o elenco inteiro — os nomes
