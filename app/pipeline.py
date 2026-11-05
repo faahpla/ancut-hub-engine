@@ -146,6 +146,17 @@ def _elenco_completo(oficial: list[str], do_banco: list[str]) -> list[str]:
     return list(oficial) + sorted(extra, key=str.lower)
 
 
+def _versao_do_corte(cfg) -> int | None:
+    """Filme e série com gente de verdade: o corte BASE (o AdaptiveDetector
+    sozinho). As regras do v2/v3 foram ajustadas em anime (flash, tela
+    branca, a nota aprendida no estudo do Levi), e em filme pioram: num
+    trecho de 10 min do "Verity" (2026), o v3 pôs 4 cortes falsos em cena
+    escura e empurrou um corte de verdade 0,4 s pro lugar errado. O base
+    acertou os cortes secos e não partiu plano longo nenhum.
+    None = o corte de sempre (v3)."""
+    return 1 if cfg.media_kind == "live" or getattr(cfg, "corte_de_live", False) else None
+
+
 def _corte_agrupamento(cfg) -> float:
     """O corte de similaridade que junta dois rostos no mesmo grupo.
 
@@ -232,6 +243,7 @@ class _Deteccao:
                     adaptive_ratio=cfg.scene_adaptive_ratio,
                     min_seconds=cfg.min_shot_seconds,
                     on_progress=progresso,
+                    versao=_versao_do_corte(cfg),
                 )
             except BaseException as e:  # noqa: BLE001 -- quem espera decide
                 d.erro = e
@@ -1073,7 +1085,9 @@ class Pipeline:
             # exatamente o lugar onde uma opinião de fora vale mais, e onde
             # um erro se multiplica: a cena resgatada errada vira fonte do
             # resgate seguinte.
-            if cfg.ccip_veto and rescues:
+            # O CCIP é treinado em personagem de ANIME: em gente de verdade
+            # ele daria qualquer resposta.
+            if cfg.ccip_veto and rescues and cfg.media_kind != "live":
                 self._veto_ccip(
                     cb=cb,
                     entries=entries,
@@ -1657,14 +1671,20 @@ class Pipeline:
         """A busca de cena por descrição já sai pronta pra este episódio (ver
         visao.py): o CLIP da análise ainda está carregado, e indexar agora
         custa uns segundos — na busca, depois, seria esperar por ele."""
-        if self.cfg.media_kind == "live":
-            return
         try:
             from .visao import indexar
 
             cb("organize", -1.0, "Preparando a busca por cena...")
-            get_engine, _ = self._lazy_models(_so_na_thread_principal(cb))
-            indexar(episode_root, [shot.idx for shot, _f, _k in cut_results], get_engine())
+            if self.cfg.media_kind == "live":
+                # O reconhecimento de gente de verdade é o ArcFace, não o
+                # CLIP: a busca (que é útil pra filme também) sobe o dela.
+                engine = EmbeddingEngine(model_name=self.cfg.clip_model,
+                                         pretrained=self.cfg.clip_pretrained,
+                                         use_cuda=self.cfg.use_cuda)
+            else:
+                get_engine, _ = self._lazy_models(_so_na_thread_principal(cb))
+                engine = get_engine()
+            indexar(episode_root, [shot.idx for shot, _f, _k in cut_results], engine)
         except Exception as e:  # noqa: BLE001 -- busca é bônus, não derruba a análise
             print(f"[CorteCenas] Indice da busca por cena falhou: {e}", flush=True)
 
@@ -1677,6 +1697,8 @@ class Pipeline:
         from .matching.ccip import CcipEngine
         from .matching.repescagem import Repescador, anime_do_episodio, bloqueios, gravar
 
+        if self.cfg.media_kind == "live":
+            return  # o CCIP é de anime; em gente de verdade não serve de juiz
         cb("organize", -1.0, "Procurando personagem nas cenas sem ninguém...")
         try:
             if getattr(self, "_ccip_repescagem", None) is None:
@@ -1903,6 +1925,64 @@ class Pipeline:
             refs_dir=refs_dir,
         )
 
+    def _parece_live_action(self, info: EpisodeInfo, pasta_anime: str, cb: ProgressCb) -> bool:
+        """O vídeo é de gente de verdade? O CLIP olha 8 quadros e compara
+        "anime" com "filme com atores". Medido: o filme "Verity" deu 8 de 8
+        quadros como filme; nove animes do acervo, no máximo 1 de 8.
+
+        Uma vez por pasta de origem (a série inteira decide no 1º episódio),
+        guardado em `tipo_de_pasta.json`. E nada se o corte já está pronto.
+        """
+        cfg = self.cfg
+        bounds = cfg.output_path / (pasta_anime or sanitize(info.anime)) / info.slug / "metadata" / "shot_bounds.json"
+        if self._bounds_do_cache(bounds, info) is not None:
+            return False
+        memo = cfg.cache_path / "tipo_de_pasta.json"
+        chave = str(Path(info.source).parent).lower()
+        try:
+            lembrado = json.loads(memo.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            lembrado = {}
+        if chave in lembrado:
+            return lembrado[chave] == "live"
+        try:
+            from PIL import Image
+
+            cb("detect_shots", -1.0, "Conferindo se é anime ou filme...")
+            cap = cv2.VideoCapture(str(info.source))
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            imagens = []
+            for k in range(8):
+                cap.set(cv2.CAP_PROP_POS_FRAMES, int(total * (0.15 + 0.7 * k / 7)))
+                ok, quadro = cap.read()
+                if ok and quadro.std() > 10:
+                    imagens.append(Image.fromarray(cv2.cvtColor(quadro, cv2.COLOR_BGR2RGB)))
+            cap.release()
+            if len(imagens) < 4:
+                return False
+            get_engine, _ = self._lazy_models(_so_na_thread_principal(cb))
+            engine = get_engine()
+            textos = engine.embed_texts([
+                "a screenshot from an anime", "a frame from a cartoon animation", "a 2D animated scene",
+                "a still frame from a live-action movie with real actors", "a photo of real people",
+                "a film still from a TV series with real actors",
+            ])
+            v = engine.embed_images(imagens)
+            margem = (v @ textos[3:].T).max(1) - (v @ textos[:3].T).max(1)
+            live = float((margem > 0).mean()) >= 0.75 and float(np.median(margem)) > 0.01
+        except Exception as e:  # noqa: BLE001 -- na dúvida, o corte de sempre
+            print(f"[CorteCenas] Nao deu pra conferir anime/filme: {e}", flush=True)
+            return False
+        lembrado[chave] = "live" if live else "anime"
+        try:
+            memo.write_text(json.dumps(lembrado, ensure_ascii=False, indent=1), encoding="utf-8")
+        except OSError:
+            pass
+        if live:
+            print("[CorteCenas] Parece filme/serie com gente de verdade: corte de live action.", flush=True)
+            cb("detect_shots", -1.0, "Parece filme com gente de verdade — usando o corte de live action")
+        return live
+
     def run_cut_only(
         self, info: EpisodeInfo, on_progress: ProgressCb | None = None
     ) -> PipelineResult:
@@ -1935,6 +2015,11 @@ class Pipeline:
             explicit=info.output_folder,
             franchise_key=cache_id,
         )
+        # Filme ou série largado no "Só cortar" com o modo em Anime: o corte de
+        # anime piora em gente de verdade (ver _versao_do_corte). Só pergunta
+        # pra título que o app não conhece como anime.
+        if cfg.media_kind != "live" and not cache_id and self._parece_live_action(info, pasta_anime, cb):
+            cfg.corte_de_live = True
         episode_root, metadata_dir, cut_results = self._prepare_shots(
             info, cb, pasta_anime
         )
@@ -2677,6 +2762,7 @@ class Pipeline:
                     on_progress=lambda f: cb(
                         "detect_shots", f, f"Analisando mudanças de cena... {int(f * 100)}%"
                     ),
+                    versao=_versao_do_corte(cfg),
                 )
             bounds_cache.write_text(
                 json.dumps(
