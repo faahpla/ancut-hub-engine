@@ -429,6 +429,10 @@ def _recent() -> None:
     # pra fora e o episódio desaparecia da tela — intacto no disco e no banco,
     # e sem uma linha explicando. Ele tinha 41 e via 30.
     sumidas = 0
+    # QUAIS sumiram, e nao so quantos: "1 episodio sem pasta no disco" sozinho
+    # nao dizia qual nem onde -- "como caralhos vc quer q eu saiba do que se
+    # trata?". A interface mostra o episodio e onde a pasta estava.
+    sem_pasta = []
     for e in db.recent_episodes():
         root = Path(e["output_root"])
         if e.get("kind") == "BROLL" and root.is_dir():
@@ -443,6 +447,17 @@ def _recent() -> None:
             # pra a tela poder dizer que existem — desaparecer calado é o que
             # faz isto parecer perda de dado.
             sumidas += 1
+            sem_pasta.append(
+                {
+                    "episodeId": e["id"],
+                    "animeTitle": e["anime_title"],
+                    "season": e["season"],
+                    "episode": e["episode"],
+                    "kind": e["kind"],
+                    "titulo": e.get("titulo") or "",
+                    "episodeRoot": str(root),
+                }
+            )
             continue
         episodes.append(
             {
@@ -463,7 +478,7 @@ def _recent() -> None:
                 "origem": e.get("origem") or "",
             }
         )
-    _emit({"type": "recent", "episodes": episodes, "missingFolders": sumidas})
+    _emit({"type": "recent", "episodes": episodes, "missingFolders": sumidas, "semPasta": sem_pasta})
 
 
 def _capa_segura(db, episode_id: int, root: Path) -> str:
@@ -1477,7 +1492,10 @@ def _delete_episode(episode_id: int, aplicar_agora: bool) -> None:
                 pass
 
     erro = ""
-    if raiz.name and not dentro:
+    # A trava e para a PASTA. Sem pasta no disco nao ha o que apagar, e so a
+    # linha do historico sai -- o caso tipico de episodio que sumiu e da pasta
+    # que mudou de lugar (ou da saida trocada), justamente fora da saida de agora.
+    if raiz.name and not dentro and raiz.is_dir():
         erro = "a pasta do episódio está fora da pasta de saída configurada"
 
     apagou = False
