@@ -102,7 +102,7 @@ def _clip_needs_download(model_name: str, pretrained: str) -> bool:
         return False
 
 
-def _bundle_do_importado(cache_path: Path, info) -> "AnimeBundle | None":
+def _bundle_do_importado(cache_path: Path, info, db=None) -> "AnimeBundle | None":
     """O elenco de um pacote importado que bate com este anime, como banco
     local -- pro caso de o anime não existir online.
 
@@ -110,7 +110,8 @@ def _bundle_do_importado(cache_path: Path, info) -> "AnimeBundle | None":
     `elencos_importados.bate`). As fotos e os centroides entram depois, pelo
     `aplicar` de sempre: aqui só nascem os nomes.
     """
-    from .storage.elencos_importados import listar
+    from .storage.anime_folders import AnimeFolderStore
+    from .storage.elencos_importados import anime_ligado, listar
 
     for el in listar(cache_path):
         if not el.bate([], [info.anime, info.output_folder or ""]):
@@ -122,11 +123,20 @@ def _bundle_do_importado(cache_path: Path, info) -> "AnimeBundle | None":
         ]
         if not refs:
             continue
+        # O pacote já ligado a um anime da Biblioteca: é ESSE o anime, com o
+        # nome e a pasta dele -- não um novo com o nome deste arquivo.
+        titulo = info.anime
+        ligado = anime_ligado(db, el) if db is not None else None
+        if ligado:
+            titulo, pasta = ligado
+            if not info.output_folder:
+                AnimeFolderStore(cache_path).remember(info.anime, pasta, local_cache_id(titulo))
         print(f"[Elenco] '{info.anime}' não está online: usando o pacote importado "
-              f"'{el.titulo}' ({len(refs)} personagens).", flush=True)
+              f"'{el.titulo}' ({len(refs)} personagens)"
+              + (f", no anime '{titulo}' que já existe." if ligado else "."), flush=True)
         return AnimeBundle(
-            anilist_id=None, mal_id=None, title=info.anime, title_english=None,
-            characters=refs, cache_id_override=local_cache_id(info.anime),
+            anilist_id=None, mal_id=None, title=titulo, title_english=None,
+            characters=refs, cache_id_override=local_cache_id(titulo),
         )
     return None
 
@@ -547,7 +557,7 @@ class Pipeline:
                 # anime: é ele o elenco. Antes a análise parava em "anime
                 # não encontrado" com os personagens importados no disco,
                 # sem nunca olhar pra eles (Levi, Avatar Seven Havens).
-                bundle = _bundle_do_importado(cfg.cache_path, info)
+                bundle = _bundle_do_importado(cfg.cache_path, info, self.db)
                 if bundle is None:
                     raise
                 cb("fetch_characters", -1.0,
@@ -1769,6 +1779,29 @@ class Pipeline:
         except Exception as e:  # noqa: BLE001 -- busca é bônus, não derruba a análise
             print(f"[CorteCenas] Indice da busca por cena falhou: {e}", flush=True)
 
+    def _anime_local_do_pacote(self, info, franquia: str, pastas) -> str:
+        """O título do anime local em que este arquivo deve entrar.
+
+        Sem identidade online (`franquia` vazia) e com um pacote importado
+        que responde por este nome E já está ligado a um anime da
+        Biblioteca, é aquele anime: a memória de pastas passa a mandar este
+        nome pra pasta dele, e o título dele é o que vai pro banco. Senão, o
+        nome do arquivo, como sempre.
+        """
+        if franquia or info.output_folder:
+            return info.anime
+        from .storage.elencos_importados import anime_ligado, pacote_do_nome
+
+        ligado = anime_ligado(self.db, pacote_do_nome(self.cfg.cache_path, [info.anime]))
+        if not ligado:
+            return info.anime
+        titulo, pasta = ligado
+        pastas.remember(info.anime, pasta, local_cache_id(titulo))
+        if titulo != info.anime:
+            print(f"[Elenco] '{info.anime}' é o mesmo anime que '{titulo}' (pacote importado): "
+                  f"vai pra pasta '{pasta}'.", flush=True)
+        return titulo
+
     def _repescar(self, cb: ProgressCb, episode_id: int, benchmark: bool = False) -> None:
         """Marca as cenas com rosto que ficaram sem ninguém, se for seguro.
 
@@ -2104,6 +2137,7 @@ class Pipeline:
         # depois vencia as análises normais.
         pastas = AnimeFolderStore(cfg.cache_path)
         cache_id = pastas.franchise_for_name(info.anime, info.season, cfg.cache_path)
+        titulo_local = self._anime_local_do_pacote(info, cache_id, pastas)
         pasta_anime = pastas.decide(
             typed=info.anime,
             explicit=info.output_folder,
@@ -2119,7 +2153,7 @@ class Pipeline:
         )
         pastas.remember(info.anime, pasta_anime, cache_id)
 
-        anime_id = self.db.upsert_anime(anilist_id=None, title=info.anime)
+        anime_id = self.db.upsert_anime(anilist_id=None, title=titulo_local)
         episode_id = self.db.upsert_episode(
             anime_id, info.season, info.episode, str(info.source), info.kind,
             root=str(episode_root),
@@ -2198,6 +2232,7 @@ class Pipeline:
         cache_id_local = pastas.franchise_for_name(
             info.anime, info.season, cfg.cache_path
         )
+        titulo_local = self._anime_local_do_pacote(info, cache_id_local, pastas)
         pasta_anime = pastas.decide(
             typed=info.anime,
             explicit=info.output_folder,
@@ -2285,12 +2320,12 @@ class Pipeline:
             cb("fetch_characters", 1.0,
                f"{anime_title} — descoberta reforçando o banco existente")
         else:
-            anime_title = info.anime
+            anime_title = titulo_local
             anime_id = self.db.upsert_anime(
-                anilist_id=None, mal_id=None, title=info.anime, title_english=None
+                anilist_id=None, mal_id=None, title=titulo_local, title_english=None
             )
-            disc_cache_id = local_cache_id(info.anime)
-            self._ligar_importados(disc_cache_id, anime_id, [], [info.anime])
+            disc_cache_id = local_cache_id(titulo_local)
+            self._ligar_importados(disc_cache_id, anime_id, [], [info.anime, titulo_local])
             # Fonte fora do ar não apaga o que já está no disco.
             #
             # Se este anime já foi analisado alguma vez, os personagens dele

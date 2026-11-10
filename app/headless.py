@@ -478,7 +478,21 @@ def _recent() -> None:
                 "origem": e.get("origem") or "",
             }
         )
-    _emit({"type": "recent", "episodes": episodes, "missingFolders": sumidas, "semPasta": sem_pasta})
+    # Pastas que são o mesmo anime (respondem pelo mesmo pacote importado):
+    # a Biblioteca oferece juntar. É o remédio pro que escapou antes de o
+    # app saber que eram o mesmo (Levi, "Avatar Seven Havens").
+    parecidos: list[list[str]] = []
+    try:
+        from .storage.elencos_importados import animes_do_pacote, listar
+
+        for el in listar(cfg.cache_path):
+            juntas = sorted({p for (_t, p) in animes_do_pacote(db, el)})
+            if len(juntas) >= 2:
+                parecidos.append(juntas)
+    except Exception:
+        parecidos = []
+    _emit({"type": "recent", "episodes": episodes, "missingFolders": sumidas,
+           "semPasta": sem_pasta, "parecidos": parecidos})
 
 
 def _capa_segura(db, episode_id: int, root: Path) -> str:
@@ -1141,6 +1155,18 @@ def _cast_import(pacote: str, titulo: str = "") -> None:
     cfg = Config.load()
     r = importar(cfg.cache_path, Path(pacote),
                  {"clip": cfg.clip_model, "pretrained": cfg.clip_pretrained}, titulo)
+    if not r.erro and titulo:
+        # Ligado a um anime que JÁ tem pasta: todo nome do pacote passa a
+        # apontar pra ela. É o que faz o próximo arquivo "Avatar.Seven.Havens"
+        # cair em "Avatar - Os Sete Refúgios" em vez de abrir outra pasta.
+        from .storage.anime_folders import AnimeFolderStore
+
+        pastas = AnimeFolderStore(cfg.cache_path)
+        pasta = pastas.decide(typed=titulo)
+        if (Path(cfg.output_dir) / pasta).is_dir():
+            for nome in {titulo, *r.titulos}:
+                if nome:
+                    pastas.remember(nome, pasta)
     _emit({"type": "cast-import", **r.payload()})
 
 
@@ -1594,7 +1620,7 @@ def _merge_anime(origem: str, destino: str, aplicar: bool) -> None:
     from .config import Config
     from .storage.anime_folders import AnimeFolderStore
     from .storage.db import Database
-    from .storage.juntar_animes import juntar, planejar
+    from .storage.juntar_animes import fundir_animes_locais, juntar, planejar
 
     cfg = Config.load()
     db = Database(cfg.cache_path / "index.db")
@@ -1604,7 +1630,23 @@ def _merge_anime(origem: str, destino: str, aplicar: bool) -> None:
     if aplicar and plano.pode:
         # Depois dos arquivos: a memória de pastas tem que seguir a mudança,
         # senão a próxima análise recria a pasta que acabou de sumir.
-        repontadas = AnimeFolderStore(cfg.cache_path).repoint(origem, destino)
+        pastas = AnimeFolderStore(cfg.cache_path)
+        repontadas = pastas.repoint(origem, destino)
+        # O nome da pasta que sumiu (e os títulos dos episódios que vieram
+        # dela) passam a apontar pro destino: senão o próximo arquivo com
+        # aquele nome recria a pasta que acabou de ser juntada.
+        pastas.remember(origem, destino)
+        destino_path = Path(cfg.output_dir) / destino
+        with db.connect() as c:
+            for r in c.execute(
+                "SELECT DISTINCT a.title FROM anime a JOIN episode e ON e.anime_id = a.id "
+                "WHERE e.output_root LIKE ?", (str(destino_path) + '%',),
+            ).fetchall():
+                pastas.remember(str(r[0]), destino)
+        fusao = fundir_animes_locais(db, destino_path)
+        if fusao["fundidos"]:
+            print(f"[Juntar] {fusao['fundidos']} anime(s) local(is) fundido(s) em um, "
+                  f"{fusao['personagens']} personagem(ns) repetido(s) virou(viraram) um.", flush=True)
 
     _emit({"type": "merge-anime", "aplicado": bool(aplicar and plano.pode),
            "repontadas": repontadas, **plano.payload()})

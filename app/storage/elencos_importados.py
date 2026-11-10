@@ -97,6 +97,47 @@ def listar(cache_path: Path) -> list[ElencoImportado]:
     return out
 
 
+def pacote_do_nome(cache_path: Path, nomes: list[str]) -> "ElencoImportado | None":
+    """O pacote importado que responde por algum destes nomes."""
+    for el in listar(cache_path):
+        if el.bate([], nomes):
+            return el
+    return None
+
+
+def animes_do_pacote(db, el: "ElencoImportado") -> dict[tuple[str, str], int]:
+    """Animes da Biblioteca SEM identidade online que respondem por uma
+    das chaves do pacote -- pelo título ou pelo nome da pasta --, com o
+    número de episódios de cada: {(título, pasta): episódios}."""
+    with db.connect() as c:
+        linhas = c.execute(
+            "SELECT a.title, e.output_root FROM anime a JOIN episode e ON e.anime_id = a.id "
+            "WHERE a.anilist_id IS NULL AND a.mal_id IS NULL AND e.output_root IS NOT NULL"
+        ).fetchall()
+    conta: dict[tuple[str, str], int] = {}
+    for r in linhas:
+        pasta = Path(str(r["output_root"])).parent.name
+        if titulo_base(r["title"]) in el.chaves_titulo or titulo_base(pasta) in el.chaves_titulo:
+            k = (str(r["title"]), pasta)
+            conta[k] = conta.get(k, 0) + 1
+    return conta
+
+
+def anime_ligado(db, el: "ElencoImportado | None") -> tuple[str, str] | None:
+    """(título, pasta) do anime da Biblioteca a que este pacote já está
+    ligado -- o de mais episódios, se houver mais de um.
+
+    É o que impede o mesmo anime de virar duas pastas quando o arquivo
+    chega com outro nome: "Avatar.Seven.Havens.S01E07" e "Avatar - Os Sete
+    Refúgios S01E10" respondem pelo mesmo pacote, e sem isto o primeiro
+    abria um anime novo ao lado do segundo (Levi, 11/2026).
+    """
+    if el is None:
+        return None
+    conta = animes_do_pacote(db, el)
+    return max(conta, key=lambda k: conta[k]) if conta else None
+
+
 def gravar(destino: Path, titulo: str, chaves: set[str], ids: set[int], personagens: list[dict]) -> None:
     destino.mkdir(parents=True, exist_ok=True)
     (destino / "elenco.json").write_text(
