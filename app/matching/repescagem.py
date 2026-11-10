@@ -186,11 +186,16 @@ class Repescador:
     nele, pra um engano não puxar outro.
     """
 
-    def __init__(self, db, anime_id: int, ccip) -> None:
+    def __init__(self, db, anime_id: int, ccip, motores: list | None = None, progresso=None) -> None:
+        """`motores`: sessões do CCIP pra embedar em paralelo (a da análise
+        tem três). `progresso(feitos, total)`: chamado da thread de quem
+        chamou, enquanto os rostos são calculados."""
         from .embedding_engine import from_bytes
 
         self.db = db
         self.ccip = ccip
+        self.motores = [m for m in (motores or []) if m is not None] or [ccip]
+        self.progresso = progresso
         with db.connect() as c:
             rows = c.execute(
                 "SELECT id, name, embedding FROM character "
@@ -262,7 +267,7 @@ class Repescador:
             if cr:
                 faltam.append((i, cr[0]))
         if faltam:
-            V = self.ccip.embed([cr for _, cr in faltam])
+            V = self._embed([cr for _, cr in faltam])
             for (i, _), v in zip(faltam, V):
                 ep_id, n, b = itens[i]
                 cache = self._cache(ep_id)
@@ -270,6 +275,48 @@ class Repescador:
                 cache.sujo = True
                 out[i] = v
         return out
+
+    def _embed(self, crops: list[np.ndarray]) -> list[np.ndarray]:
+        """CCIP dos recortes, divididos entre as sessões, um rosto por vez.
+
+        É a receita da análise (`_embed_em_paralelo` no pipeline): no
+        processador, lote de 1 é o mais rápido (153 contra 240 ms/rosto no
+        de 8, medido) e dá o MESMO vetor de qualquer lote. Antes isto era um
+        lote de 8 numa sessão só, e era a "travadinha" dos 98%: 312 rostos,
+        76 s, sem a tela mudar.
+
+        O progresso é contado aqui, na thread de quem chamou, a cada meio
+        segundo — o callback da análise só pode ser chamado dela.
+        """
+        import threading
+        from concurrent.futures import ThreadPoolExecutor, wait
+
+        total = len(crops)
+        saida: list = [None] * total
+        feitos = [0]
+        trava = threading.Lock()
+        grupos = [list(range(k, total, len(self.motores))) for k in range(len(self.motores))]
+
+        def fazer(motor, ids):
+            for j in range(0, len(ids), 4):
+                parte = ids[j:j + 4]
+                V = motor.embed([crops[x] for x in parte], batch=1)
+                for x, v in zip(parte, V):
+                    saida[x] = v
+                with trava:
+                    feitos[0] += len(parte)
+
+        with ThreadPoolExecutor(max_workers=len(self.motores)) as pool:
+            futuros = [pool.submit(fazer, m, g) for m, g in zip(self.motores, grupos) if g]
+            while True:
+                prontos, pendentes = wait(futuros, timeout=0.5)
+                if self.progresso is not None:
+                    self.progresso(feitos[0], total)
+                if not pendentes:
+                    break
+            for f in futuros:
+                f.result()  # erro de uma sessão sobe, como antes
+        return saida
 
     def _banco(self, ep_id: int):
         """Banco pro episódio: até DO_EPISODIO rostos dele + DE_FORA de

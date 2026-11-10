@@ -51,6 +51,7 @@ from .matching.group_rescue import decide, diverse_representatives, rank_charact
 from .matching.second_pass import ShotFaces, build_episode_banks, rescue_unassigned
 from .pipeline_types import (
     AIMode,
+    AnimeNotFoundError,
     DiscoveredGroup,
     DiscoveryResult,
     DiscoveryShot,
@@ -99,6 +100,35 @@ def _clip_needs_download(model_name: str, pretrained: str) -> bool:
         return True
     except Exception:
         return False
+
+
+def _bundle_do_importado(cache_path: Path, info) -> "AnimeBundle | None":
+    """O elenco de um pacote importado que bate com este anime, como banco
+    local -- pro caso de o anime não existir online.
+
+    Bate pelo nome digitado e pela pasta escolhida (ver
+    `elencos_importados.bate`). As fotos e os centroides entram depois, pelo
+    `aplicar` de sempre: aqui só nascem os nomes.
+    """
+    from .storage.elencos_importados import listar
+
+    for el in listar(cache_path):
+        if not el.bate([], [info.anime, info.output_folder or ""]):
+            continue
+        nomes = [str(p.get("nome") or "").strip() for p in el.personagens]
+        refs = [
+            CharacterRef(mal_id=None, anilist_id=None, name=n, role="Main", image_urls=[])
+            for n in nomes if n
+        ]
+        if not refs:
+            continue
+        print(f"[Elenco] '{info.anime}' não está online: usando o pacote importado "
+              f"'{el.titulo}' ({len(refs)} personagens).", flush=True)
+        return AnimeBundle(
+            anilist_id=None, mal_id=None, title=info.anime, title_english=None,
+            characters=refs, cache_id_override=local_cache_id(info.anime),
+        )
+    return None
 
 
 def _cache_id_for(bundle) -> str:
@@ -317,20 +347,28 @@ class _CcipPorTras:
 
     @classmethod
     def comecar(cls, cfg) -> "_CcipPorTras":
-        from concurrent.futures import ThreadPoolExecutor
+        import threading
+        from concurrent.futures import Future
 
         from .matching.ccip import CcipEngine
 
         c = cls()
+        c._futuro = Future()
 
         def subir():
-            e = CcipEngine(threads=4)
-            _ = e.disponivel  # carrega as sessoes (e baixa na 1a vez)
-            return e
+            try:
+                e = CcipEngine(threads=4)
+                _ = e.disponivel  # carrega as sessoes (e baixa na 1a vez)
+                c._futuro.set_result(e)
+            except BaseException as ex:  # noqa: BLE001
+                c._futuro.set_exception(ex)
 
-        pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ccip")
-        c._futuro = pool.submit(subir)
-        pool.shutdown(wait=False)
+        # Thread DAEMON, e nao ThreadPoolExecutor. O Python espera todo
+        # worker de executor terminar antes de sair: quando a analise parava
+        # cedo ("anime nao encontrado") com o CCIP ainda baixando na 1a vez, o
+        # motor ficava vivo ate o download acabar -- e o app recusava qualquer
+        # analise nova com "ja existe uma analise em andamento" (Levi, 1.38.1).
+        threading.Thread(target=subir, name="ccip", daemon=True).start()
         return c
 
     def engine(self):
@@ -493,16 +531,27 @@ class Pipeline:
             else {}
         )
         try:
-            bundle = provider.resolve(
-                info.anime,
-                max_characters=cfg.max_characters_per_anime,
-                images_per_character=cfg.references_per_character,
-                on_status=lambda m: cb("fetch_characters", -1.0, m),
-                use_danbooru=cfg.use_danbooru,
-                gallery_for_top=cfg.gallery_for_top_characters,
-                season=info.season,
-                **extra,
-            )
+            try:
+                bundle = provider.resolve(
+                    info.anime,
+                    max_characters=cfg.max_characters_per_anime,
+                    images_per_character=cfg.references_per_character,
+                    on_status=lambda m: cb("fetch_characters", -1.0, m),
+                    use_danbooru=cfg.use_danbooru,
+                    gallery_for_top=cfg.gallery_for_top_characters,
+                    season=info.season,
+                    **extra,
+                )
+            except AnimeNotFoundError:
+                # Sem elenco online, mas com um PACOTE importado pra este
+                # anime: é ele o elenco. Antes a análise parava em "anime
+                # não encontrado" com os personagens importados no disco,
+                # sem nunca olhar pra eles (Levi, Avatar Seven Havens).
+                bundle = _bundle_do_importado(cfg.cache_path, info)
+                if bundle is None:
+                    raise
+                cb("fetch_characters", -1.0,
+                   f"Não está online — usando os {len(bundle.characters)} personagens importados")
         except BaseException:
             if deteccao is not None:
                 deteccao.parar.set()
@@ -1733,16 +1782,26 @@ class Pipeline:
             return  # o CCIP é de anime; em gente de verdade não serve de juiz
         cb("organize", -1.0, "Procurando personagem nas cenas sem ninguém...")
         try:
+            por_tras = getattr(self, "_ccip_por_tras", None)
             if getattr(self, "_ccip_repescagem", None) is None:
-                por_tras = getattr(self, "_ccip_por_tras", None)
                 engine = por_tras.engine() if por_tras is not None else CcipEngine()
                 if not engine.disponivel:
                     return
                 self._ccip_repescagem = engine
+            # As mesmas sessões em paralelo que a análise usa (ver _embed).
+            motores = (
+                por_tras.motores(self._ccip_repescagem) if por_tras is not None
+                else [self._ccip_repescagem]
+            )
+
+            def progresso(feitos: int, total: int) -> None:
+                if total >= 8:
+                    cb("organize", -1.0,
+                       f"Procurando personagem nas cenas sem ninguém: rosto {feitos} de {total}")
             anime_id = anime_do_episodio(self.db, episode_id)
             if anime_id is None:
                 return
-            rep = Repescador(self.db, anime_id, self._ccip_repescagem)
+            rep = Repescador(self.db, anime_id, self._ccip_repescagem, motores, progresso)
             # No benchmark a curadoria é o gabarito: não entra (ver run()).
             achadas, palpites = rep.repescar(
                 episode_id, set() if benchmark else bloqueios(self.db, episode_id)

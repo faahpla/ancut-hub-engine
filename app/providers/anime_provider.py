@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import time
+import unicodedata
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable
@@ -66,6 +67,49 @@ def _search_variants(anime_name: str, season: int = 1) -> list[str]:
         if cut >= 3:
             add(" ".join(words[:cut]))
     return out
+
+
+# Palavras que não identificam anime nenhum: artigo, preposição, partícula.
+_VAZIAS = {
+    "the", "a", "an", "of", "and", "s", "no", "wa", "ga", "wo", "to", "ni",
+    "de", "da", "do", "das", "dos", "e", "o", "os", "as", "um", "uma",
+    "el", "la", "los", "las", "le", "les",
+}
+# Marca de temporada no título do candidato: não conta contra nem a favor.
+_TEMPORADA_RE = re.compile(r"^(?:\d+(?:st|nd|rd|th)?|season|part|cour|final|ii|iii|iv)$")
+
+
+def _palavras(texto: str) -> list[str]:
+    t = unicodedata.normalize("NFKD", texto or "")
+    t = "".join(c for c in t if not unicodedata.combining(c)).lower()
+    return [w for w in re.findall(r"[a-z0-9]+", t) if w not in _VAZIAS]
+
+
+def _truncado_plausivel(original: str, consulta: str, titulos: list[str]) -> bool:
+    """Um acerto achado com o nome ENCURTADO só vale se fizer sentido.
+
+    O caso do Levi (11/2026): "Avatar - Os Sete Refúgios" não foi achado, a
+    busca foi cortando o fim até "Avatar - Os" -- que é só "Avatar" -- e o
+    MyAnimeList devolveu Quanzhi Gaoshou (The King's Avatar). Vinte e dois
+    personagens de outro anime gravados com embedding, contaminando o
+    reconhecimento. Achar nada é melhor que achar errado.
+
+    Busca com o nome inteiro (ou troca de partícula, "Season N") passa
+    direto. Encurtado, precisa de: (1) pelo menos duas palavras de verdade
+    no que sobrou, e (2) o anime achado ter o nome DENTRO do original --
+    60% das palavras de algum título dele (sem a marca de temporada).
+    """
+    po, pc = _palavras(original), _palavras(consulta)
+    if len(pc) >= len(po):
+        return True
+    if len(pc) < 2:
+        return False
+    alvo = set(po)
+    for t in titulos:
+        pt = {w for w in _palavras(t) if not _TEMPORADA_RE.match(w)}
+        if pt and len(pt & alvo) / len(pt) >= 0.6:
+            return True
+    return False
 
 
 @dataclass
@@ -587,6 +631,12 @@ class AnimeProvider:
                 # keep the last error so we can log it before falling back.
                 anilist_error = e
                 anime = None
+            if anime is not None and not _truncado_plausivel(
+                anime_name, q, [anime.title or "", anime.title_english or ""]
+            ):
+                status(f"'{q}' achou '{anime.title}', que não tem a ver com '{anime_name}' — descartado.")
+                anime = None
+                continue
             if anime is not None:
                 used_query = q
                 break
@@ -610,6 +660,12 @@ class AnimeProvider:
             fails_pre_search = self.mal_site.failures
             for q in queries:
                 jikan_hit = self._buscar_no_mal(q)
+                if jikan_hit is not None and not _truncado_plausivel(
+                    anime_name, q, [jikan_hit.title or "", jikan_hit.title_english or ""]
+                ):
+                    status(f"'{q}' achou '{jikan_hit.title}', que não tem a ver com '{anime_name}' — descartado.")
+                    jikan_hit = None
+                    continue
                 if jikan_hit is not None:
                     used_query = q
                     break
