@@ -1631,18 +1631,20 @@ def _merge_anime(origem: str, destino: str, aplicar: bool) -> None:
         # Depois dos arquivos: a memória de pastas tem que seguir a mudança,
         # senão a próxima análise recria a pasta que acabou de sumir.
         pastas = AnimeFolderStore(cfg.cache_path)
-        repontadas = pastas.repoint(origem, destino)
+        # A memória de pastas guarda o NOME (dentro da saída), não o caminho.
+        nome_origem, nome_destino = Path(origem).name, Path(destino).name
+        repontadas = pastas.repoint(nome_origem, nome_destino)
         # O nome da pasta que sumiu (e os títulos dos episódios que vieram
         # dela) passam a apontar pro destino: senão o próximo arquivo com
         # aquele nome recria a pasta que acabou de ser juntada.
-        pastas.remember(origem, destino)
+        pastas.remember(nome_origem, nome_destino)
         destino_path = Path(cfg.output_dir) / destino
         with db.connect() as c:
             for r in c.execute(
                 "SELECT DISTINCT a.title FROM anime a JOIN episode e ON e.anime_id = a.id "
                 "WHERE e.output_root LIKE ?", (str(destino_path) + '%',),
             ).fetchall():
-                pastas.remember(str(r[0]), destino)
+                pastas.remember(str(r[0]), nome_destino)
         fusao = fundir_animes_locais(db, destino_path)
         if fusao["fundidos"]:
             print(f"[Juntar] {fusao['fundidos']} anime(s) local(is) fundido(s) em um, "

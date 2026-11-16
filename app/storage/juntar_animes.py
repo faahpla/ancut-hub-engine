@@ -61,18 +61,29 @@ def _episodios(pasta: Path) -> list[Path]:
 
 def planejar(output_dir: Path | str, origem: str, destino: str, db: Database) -> PlanoJuncao:
     """Simula a junção. Não escreve nada."""
+    # `origem`/`destino` podem ser o NOME (dentro da saída) ou o caminho
+    # completo -- é o caso de duas pastas com o mesmo nome em lugares
+    # diferentes ("D:\Animes\Black Clover" e "D:\Filmes\...\Black Clover",
+    # depois de a saída ter sido trocada pra cortar um filme). Pelo nome só,
+    # as duas eram a mesma e juntar era impossível.
     raiz = Path(output_dir)
     po, pd = raiz / origem, raiz / destino
     plano = PlanoJuncao(origem=origem, destino=destino)
 
-    if origem == destino:
+    if str(po).lower() == str(pd).lower():
         plano.erro = "origem e destino são a mesma pasta"
         return plano
+    if po.drive.lower() != pd.drive.lower():
+        # Mover entre discos é copiar e apagar: os clipes, que existem uma vez
+        # com vários nomes (hardlinks), virariam cópias de verdade.
+        plano.erro = (f"as pastas estão em discos diferentes ({po.drive} e {pd.drive}): "
+                      "mova uma delas pro outro disco pelo Explorer e tente de novo")
+        return plano
     if not po.is_dir():
-        plano.erro = f"não achei a pasta '{origem}'"
+        plano.erro = f"não achei a pasta '{po}'"
         return plano
     if not pd.is_dir():
-        plano.erro = f"não achei a pasta '{destino}'"
+        plano.erro = f"não achei a pasta '{pd}'"
         return plano
 
     for ep in _episodios(po):
