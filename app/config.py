@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,12 +10,22 @@ from platformdirs import user_config_dir, user_data_dir, user_documents_dir
 
 APP_NAME = "CorteCenas"
 CONFIG_DIR = Path(user_config_dir(APP_NAME))
-CONFIG_FILE = CONFIG_DIR / "config.json"
 
 # When PyInstaller-frozen, `PROJECT_ROOT` points inside Program Files —
 # read-only for non-admins. Use the current user's Documents / LocalAppData
 # instead, so the installed app can write without UAC prompts.
-_FROZEN = getattr(sys, "frozen", False)
+#
+# O Dangai roda este motor do FONTE, no Python que ele mesmo instala
+# (resources/motor/ancut), mas com os dados do app instalado: o mesmo
+# config.json, o mesmo index.db e as mesmas fotos do elenco do AnCut HUB, para
+# os dois apps verem o mesmo acervo. ANCUT_COMO_INSTALADO=1 faz o fonte se
+# comportar como o instalado. ANCUT_DADOS=<pasta> troca a pasta inteira
+# (config, cache, modelos): os testes do Dangai nunca encostam no acervo real.
+_FROZEN = getattr(sys, "frozen", False) or os.environ.get("ANCUT_COMO_INSTALADO") == "1"
+_DADOS = os.environ.get("ANCUT_DADOS", "").strip()
+if _DADOS:
+    CONFIG_DIR = Path(_DADOS)
+CONFIG_FILE = CONFIG_DIR / "config.json"
 
 # Only these fields are written to the JSON between sessions. Matching
 # parameters live in this file and are controlled by the code — editing
@@ -43,7 +54,11 @@ _PERSISTED_FIELDS = (
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if _FROZEN:
+if _DADOS:
+    DEFAULT_OUTPUT = Path(user_documents_dir()) / "CorteCenas" / "Output"
+    DEFAULT_CACHE = Path(_DADOS) / "cache"
+    DEFAULT_MODELS = Path(_DADOS) / "models"
+elif _FROZEN:
     # Installed app: write to user profile locations.
     DEFAULT_OUTPUT = Path(user_documents_dir()) / "CorteCenas" / "Output"
     DEFAULT_CACHE = Path(user_data_dir(APP_NAME)) / "cache"
@@ -279,7 +294,10 @@ class Config:
     clip_pretrained: str = "openai"
 
     # GPU
-    use_cuda: bool = True  # falls back to CPU automatically if unavailable
+    # ANCUT_SEM_CUDA=1: a placa nao roda o torch instalado (o Dangai confere
+    # com uma conta na GPU depois de instalar). O torch vai para a CPU em vez
+    # de quebrar no primeiro kernel; o NVENC do ffmpeg continua.
+    use_cuda: bool = os.environ.get("ANCUT_SEM_CUDA", "") != "1"  # falls back to CPU automatically if unavailable
 
     # UI
     language: str = "pt"

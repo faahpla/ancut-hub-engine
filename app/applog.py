@@ -26,7 +26,14 @@ logging.raiseExceptions = False
 
 def log_dir() -> Path:
     # Same location run.py uses for crash.log, so users find everything
-    # in one folder.
+    # in one folder. ANCUT_DADOS (os testes do Dangai): os logs vao junto.
+    import os
+
+    dados = os.environ.get("ANCUT_DADOS", "").strip()
+    if dados:
+        base = Path(dados) / "logs"
+        base.mkdir(parents=True, exist_ok=True)
+        return base
     try:
         from platformdirs import user_log_dir
         base = Path(user_log_dir("CorteCenas"))
